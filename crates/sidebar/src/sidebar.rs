@@ -110,6 +110,7 @@ const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
 const WORKTREE_LABELS_KEY: &str = "agent_sidebar_worktree_labels";
 const WORKTREE_ORDER_KEY: &str = "agent_sidebar_worktree_order";
+const PROJECT_GROUP_ORDER_KEY: &str = "agent_sidebar_project_group_order";
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SerializedSidebarView {
@@ -133,6 +134,8 @@ struct SerializedSidebar {
     active_view: SerializedSidebarView,
     #[serde(default)]
     thread_grouping: ThreadGroupingMode,
+    #[serde(default)]
+    show_open_worktrees_only: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +435,32 @@ impl WorktreeEntry {
 struct DraggedWorktree {
     order_key: String,
     label_key: String,
+}
+
+#[derive(Clone)]
+struct DraggedProjectGroup {
+    key: String,
+}
+
+#[derive(Clone, Copy)]
+enum ReorderDropPosition {
+    Before,
+    After,
+}
+
+fn reorder_drop_position(
+    order: &[String],
+    source_key: &str,
+    target_key: &str,
+) -> ReorderDropPosition {
+    let source_position = order.iter().position(|key| key == source_key);
+    let target_position = order.iter().position(|key| key == target_key);
+
+    if source_position < target_position {
+        ReorderDropPosition::After
+    } else {
+        ReorderDropPosition::Before
+    }
 }
 
 #[derive(Clone)]
@@ -868,6 +897,15 @@ fn load_worktree_order(cx: &App) -> HashMap<String, Vec<String>> {
         .unwrap_or_default()
 }
 
+fn load_project_group_order(cx: &App) -> Vec<String> {
+    db::kvp::KeyValueStore::global(cx)
+        .read_kvp(PROJECT_GROUP_ORDER_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|order| serde_json::from_str::<Vec<String>>(&order).log_err())
+        .unwrap_or_default()
+}
+
 fn remote_host_key(host: Option<&RemoteConnectionOptions>) -> String {
     host.and_then(|host| serde_json::to_string(host).ok())
         .unwrap_or_else(|| "local".to_string())
@@ -895,6 +933,10 @@ fn worktree_order_key(group_key: &ProjectGroupKey) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{}|{}", remote_host_key(group_key.host().as_ref()), paths)
+}
+
+fn project_group_order_key(group_key: &ProjectGroupKey) -> String {
+    worktree_order_key(group_key)
 }
 
 /// Shows a [`RemoteConnectionModal`] on the given workspace and establishes
@@ -1086,8 +1128,10 @@ pub struct Sidebar {
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
     worktree_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     thread_grouping: ThreadGroupingMode,
+    show_open_worktrees_only: bool,
     worktree_labels: HashMap<String, SharedString>,
     worktree_order: HashMap<String, Vec<String>>,
+    project_group_order: Vec<String>,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
@@ -1115,6 +1159,7 @@ impl Sidebar {
         AgentThreadWorktreeLabelFlag::watch(cx);
         let worktree_labels = load_worktree_labels(cx);
         let worktree_order = load_worktree_order(cx);
+        let project_group_order = load_project_group_order(cx);
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -1230,8 +1275,10 @@ impl Sidebar {
             worktree_default_branches: HashMap::new(),
             worktree_menu_handles: HashMap::new(),
             thread_grouping: ThreadGroupingMode::default(),
+            show_open_worktrees_only: false,
             worktree_labels,
             worktree_order,
+            project_group_order,
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
@@ -1428,6 +1475,16 @@ impl Sidebar {
         });
     }
 
+    fn persist_project_group_order(&self, cx: &App) {
+        let order = self.project_group_order.clone();
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            let serialized = serde_json::to_string(&order)?;
+            kvp.write_kvp(PROJECT_GROUP_ORDER_KEY.to_string(), serialized)
+                .await
+        });
+    }
+
     fn set_worktree_label(&mut self, label_key: String, label: String, cx: &mut Context<Self>) {
         let label = label.trim();
         if label.is_empty() {
@@ -1443,6 +1500,73 @@ impl Sidebar {
     fn clear_worktree_label(&mut self, label_key: &str, cx: &mut Context<Self>) {
         self.worktree_labels.remove(label_key);
         self.persist_worktree_labels(cx);
+        self.update_entries(cx);
+    }
+
+    fn apply_project_group_order(&mut self, groups: &mut Vec<workspace::ProjectGroup>, cx: &App) {
+        let current_keys = groups
+            .iter()
+            .map(|group| project_group_order_key(&group.key))
+            .collect::<HashSet<_>>();
+        let previous_order = self.project_group_order.clone();
+
+        self.project_group_order
+            .retain(|group_key| current_keys.contains(group_key));
+        let mut ordered_keys = self
+            .project_group_order
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        for group in groups.iter() {
+            let key = project_group_order_key(&group.key);
+            if ordered_keys.insert(key.clone()) {
+                self.project_group_order.push(key);
+            }
+        }
+
+        if self.project_group_order != previous_order {
+            self.persist_project_group_order(cx);
+        }
+
+        let positions = self
+            .project_group_order
+            .iter()
+            .enumerate()
+            .map(|(index, group_key)| (group_key.clone(), index))
+            .collect::<HashMap<_, _>>();
+
+        groups.sort_by(|left, right| {
+            positions
+                .get(&project_group_order_key(&left.key))
+                .cmp(&positions.get(&project_group_order_key(&right.key)))
+        });
+    }
+
+    fn reorder_project_group(
+        &mut self,
+        source_key: String,
+        target_key: String,
+        drop_position: ReorderDropPosition,
+        cx: &mut Context<Self>,
+    ) {
+        if source_key == target_key {
+            return;
+        }
+
+        self.project_group_order
+            .retain(|group_key| group_key != &source_key);
+        let target_index = self
+            .project_group_order
+            .iter()
+            .position(|group_key| group_key == &target_key);
+        let insert_index = match (drop_position, target_index) {
+            (ReorderDropPosition::Before, Some(index)) => index,
+            (ReorderDropPosition::After, Some(index)) => index + 1,
+            (_, None) => self.project_group_order.len(),
+        };
+        self.project_group_order.insert(insert_index, source_key);
+
+        self.persist_project_group_order(cx);
         self.update_entries(cx);
     }
 
@@ -1499,6 +1623,7 @@ impl Sidebar {
         order_key: String,
         source_label_key: String,
         target_label_key: String,
+        drop_position: ReorderDropPosition,
         cx: &mut Context<Self>,
     ) {
         if source_label_key == target_label_key {
@@ -1510,10 +1635,14 @@ impl Sidebar {
         };
 
         order.retain(|label_key| label_key != &source_label_key);
-        let insert_index = order
+        let target_index = order
             .iter()
-            .position(|label_key| label_key == &target_label_key)
-            .unwrap_or(order.len());
+            .position(|label_key| label_key == &target_label_key);
+        let insert_index = match (drop_position, target_index) {
+            (ReorderDropPosition::Before, Some(index)) => index,
+            (ReorderDropPosition::After, Some(index)) => index + 1,
+            (_, None) => order.len(),
+        };
         order.insert(insert_index, source_label_key);
 
         self.persist_worktree_order(cx);
@@ -1600,7 +1729,7 @@ impl Sidebar {
                     });
                     let is_open = open_worktree_paths.contains(&worktree.path);
                     let is_current = current_worktree_paths.contains(&worktree.path);
-                    let can_delete = !worktree.is_main && !is_open;
+                    let can_delete = !worktree.is_main;
 
                     entries_by_path.insert(
                         worktree.path.clone(),
@@ -1996,7 +2125,8 @@ impl Sidebar {
             (icon, icon_from_external_svg)
         };
 
-        let groups = mw.project_groups(cx);
+        let mut groups = mw.project_groups(cx);
+        self.apply_project_group_order(&mut groups, cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
@@ -2429,6 +2559,9 @@ impl Sidebar {
                     cx,
                 );
                 self.apply_worktree_order(group_key, &mut worktree_entries, cx);
+                if self.show_open_worktrees_only {
+                    worktree_entries.retain(|entry| entry.is_open);
+                }
                 let has_worktree_groups = !worktree_entries.is_empty();
 
                 let mut threads_by_worktree: HashMap<PathBuf, Vec<ThreadEntry>> = HashMap::new();
@@ -2492,44 +2625,60 @@ impl Sidebar {
                         .push((WorktreeListEntry::Worktree(worktree), worktree_threads));
                 }
 
-                let mut stale_groups = stale_threads_by_worktree.into_iter().collect::<Vec<_>>();
-                stale_groups.sort_by(|(left, _), (right, _)| left.cmp(right));
-                for (path, mut worktree_threads) in stale_groups {
-                    let mut stale = StaleWorktreeEntry {
-                        path: path.clone(),
-                        display_name: Self::stale_worktree_display_name(&path),
-                        highlight_positions: Vec::new(),
-                        thread_count: worktree_threads.len(),
-                    };
-                    let worktree_matched =
-                        !query.is_empty() && apply_stale_worktree_query_match(&mut stale, &query);
+                if !self.show_open_worktrees_only {
+                    let mut stale_groups =
+                        stale_threads_by_worktree.into_iter().collect::<Vec<_>>();
+                    stale_groups.sort_by(|(left, _), (right, _)| left.cmp(right));
+                    for (path, mut worktree_threads) in stale_groups {
+                        let mut stale = StaleWorktreeEntry {
+                            path: path.clone(),
+                            display_name: Self::stale_worktree_display_name(&path),
+                            highlight_positions: Vec::new(),
+                            thread_count: worktree_threads.len(),
+                        };
+                        let worktree_matched = !query.is_empty()
+                            && apply_stale_worktree_query_match(&mut stale, &query);
 
-                    if !query.is_empty() {
-                        if workspace_matched || worktree_matched {
-                            for thread in &mut worktree_threads {
-                                apply_thread_query_match(thread, &query, true);
+                        if !query.is_empty() {
+                            if workspace_matched || worktree_matched {
+                                for thread in &mut worktree_threads {
+                                    apply_thread_query_match(thread, &query, true);
+                                }
+                            } else {
+                                worktree_threads = worktree_threads
+                                    .into_iter()
+                                    .filter_map(|mut thread| {
+                                        apply_thread_query_match(&mut thread, &query, false)
+                                            .then_some(thread)
+                                    })
+                                    .collect();
                             }
-                        } else {
-                            worktree_threads = worktree_threads
-                                .into_iter()
-                                .filter_map(|mut thread| {
-                                    apply_thread_query_match(&mut thread, &query, false)
-                                        .then_some(thread)
-                                })
-                                .collect();
+
+                            if !workspace_matched
+                                && !worktree_matched
+                                && worktree_threads.is_empty()
+                            {
+                                continue;
+                            }
                         }
 
-                        if !workspace_matched && !worktree_matched && worktree_threads.is_empty() {
-                            continue;
-                        }
+                        grouped_worktrees.push((WorktreeListEntry::Stale(stale), worktree_threads));
                     }
+                }
 
-                    grouped_worktrees.push((WorktreeListEntry::Stale(stale), worktree_threads));
+                if self.show_open_worktrees_only && grouped_worktrees.is_empty() {
+                    continue;
                 }
 
                 if !query.is_empty() && grouped_worktrees.is_empty() && !workspace_matched {
                     continue;
                 }
+
+                let has_visible_children = if self.show_open_worktrees_only {
+                    has_worktree_groups
+                } else {
+                    has_threads || has_worktree_groups
+                };
 
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
@@ -2539,7 +2688,7 @@ impl Sidebar {
                     has_running_threads,
                     waiting_thread_count,
                     is_active,
-                    has_threads: has_threads || has_worktree_groups,
+                    has_threads: has_visible_children,
                 });
 
                 if is_collapsed && query.is_empty() {
@@ -3029,6 +3178,11 @@ impl Sidebar {
 
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
+        let dragged_project_group = DraggedProjectGroup {
+            key: project_group_order_key(key),
+        };
+        let target_project_group_key = dragged_project_group.key.clone();
+        let project_group_order = self.project_group_order.clone();
 
         // The fade gradient renders as a visible patch on transparent windows,
         // so truncate the label instead.
@@ -3191,6 +3345,60 @@ impl Sidebar {
                     }
                 }),
             )
+            .when(!is_sticky, |this| {
+                this.on_drag(dragged_project_group, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| gpui::Empty)
+                })
+                .drag_over::<DraggedProjectGroup>({
+                    let target_project_group_key = target_project_group_key.clone();
+                    move |header, dragged_project_group, _, cx| {
+                        if dragged_project_group.key == target_project_group_key {
+                            return header;
+                        }
+
+                        let drop_position = reorder_drop_position(
+                            &project_group_order,
+                            &dragged_project_group.key,
+                            &target_project_group_key,
+                        );
+                        let header = header
+                            .bg(cx.theme().colors().drop_target_background)
+                            .border_color(cx.theme().colors().drop_target_border)
+                            .border_0();
+                        match drop_position {
+                            ReorderDropPosition::Before => header.border_t_2(),
+                            ReorderDropPosition::After => header.border_b_2(),
+                        }
+                    }
+                })
+                .can_drop({
+                    let target_project_group_key = target_project_group_key.clone();
+                    move |dragged, _, _| {
+                        dragged
+                            .downcast_ref::<DraggedProjectGroup>()
+                            .is_some_and(|dragged| {
+                                dragged.key.as_str() != target_project_group_key.as_str()
+                            })
+                    }
+                })
+                .on_drop(cx.listener({
+                    let target_project_group_key = project_group_order_key(key);
+                    move |this, dragged: &DraggedProjectGroup, _window, cx| {
+                        let drop_position = reorder_drop_position(
+                            &this.project_group_order,
+                            &dragged.key,
+                            &target_project_group_key,
+                        );
+                        this.reorder_project_group(
+                            dragged.key.clone(),
+                            target_project_group_key.clone(),
+                            drop_position,
+                            cx,
+                        );
+                    }
+                }))
+            })
             .block_mouse_except_scroll();
 
         if !is_collapsed && !has_threads {
@@ -7072,6 +7280,7 @@ impl Sidebar {
                     this.border_color(gpui::transparent_black())
                 }
             })
+            .when(is_current, |this| this.bg(color.element_active))
             .hover(|this| this.bg(color.element_hover))
             .child(Icon::new(icon).size(IconSize::Small).color(icon_color))
             .child(
@@ -7111,12 +7320,18 @@ impl Sidebar {
             WorktreeListEntry::Worktree(entry) => {
                 let entry_for_click = entry.clone();
                 let entry_for_new_thread = entry.clone();
+                let entry_for_close = entry.clone();
                 let dragged_worktree = DraggedWorktree {
                     order_key: entry.order_key.clone(),
                     label_key: entry.label_key.clone(),
                 };
                 let target_order_key = entry.order_key.clone();
                 let target_label_key = entry.label_key.clone();
+                let worktree_order = self
+                    .worktree_order
+                    .get(&entry.order_key)
+                    .cloned()
+                    .unwrap_or_default();
 
                 row.child(
                     h_flex()
@@ -7143,27 +7358,83 @@ impl Sidebar {
                                 },
                             )),
                         )
+                        .when(entry.is_open, |this| {
+                            this.child(
+                                IconButton::new(
+                                    SharedString::from(format!("worktree-row-close-{ix}")),
+                                    IconName::Close,
+                                )
+                                .icon_size(IconSize::Small)
+                                .visible_on_hover(&group_name)
+                                .tooltip(Tooltip::text("Close Worktree"))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.close_worktree(&entry_for_close, window, cx);
+                                    },
+                                )),
+                            )
+                        })
                         .child(self.render_worktree_ellipsis_menu(ix, entry, &group_name, cx)),
                 )
                 .on_drag(dragged_worktree, |_, _, _, cx| {
                     cx.stop_propagation();
                     cx.new(|_| gpui::Empty)
                 })
-                .can_drop(move |dragged, _, _| {
-                    dragged
-                        .downcast_ref::<DraggedWorktree>()
-                        .is_some_and(|dragged| {
-                            dragged.order_key == target_order_key
-                                && dragged.label_key != target_label_key
-                        })
+                .drag_over::<DraggedWorktree>({
+                    let target_order_key = target_order_key.clone();
+                    let target_label_key = target_label_key.clone();
+                    move |row, dragged_worktree, _, cx| {
+                        if dragged_worktree.order_key != target_order_key
+                            || dragged_worktree.label_key == target_label_key
+                        {
+                            return row;
+                        }
+
+                        let drop_position = reorder_drop_position(
+                            &worktree_order,
+                            &dragged_worktree.label_key,
+                            &target_label_key,
+                        );
+                        let row = row
+                            .bg(cx.theme().colors().drop_target_background)
+                            .border_color(cx.theme().colors().drop_target_border)
+                            .border_0();
+                        match drop_position {
+                            ReorderDropPosition::Before => row.border_t_2(),
+                            ReorderDropPosition::After => row.border_b_2(),
+                        }
+                    }
+                })
+                .can_drop({
+                    let target_order_key = target_order_key.clone();
+                    let target_label_key = target_label_key.clone();
+                    move |dragged, _, _| {
+                        dragged
+                            .downcast_ref::<DraggedWorktree>()
+                            .is_some_and(|dragged| {
+                                dragged.order_key == target_order_key
+                                    && dragged.label_key.as_str() != target_label_key.as_str()
+                            })
+                    }
                 })
                 .on_drop(cx.listener({
                     let target_label_key = entry.label_key.clone();
                     move |this, dragged: &DraggedWorktree, _window, cx| {
+                        let worktree_order = this
+                            .worktree_order
+                            .get(&dragged.order_key)
+                            .cloned()
+                            .unwrap_or_default();
+                        let drop_position = reorder_drop_position(
+                            &worktree_order,
+                            &dragged.label_key,
+                            &target_label_key,
+                        );
                         this.reorder_worktree(
                             dragged.order_key.clone(),
                             dragged.label_key.clone(),
                             target_label_key.clone(),
+                            drop_position,
                             cx,
                         );
                     }
@@ -7273,6 +7544,7 @@ impl Sidebar {
                                     .update(cx, |sidebar, cx| {
                                         sidebar.create_worktree_for_group(
                                             &create_group_key,
+                                            NewWorktreeBranchTarget::CurrentBranch,
                                             window,
                                             cx,
                                         );
@@ -8362,6 +8634,29 @@ impl Sidebar {
         })
     }
 
+    fn close_worktree(
+        &mut self,
+        entry: &WorktreeEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace_for_worktree_path(&entry.group_key, entry.path(), cx)
+        else {
+            return;
+        };
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace
+                .close_workspace(&workspace, window, cx)
+                .detach_and_log_err(cx);
+        });
+        self.selection = None;
+        self.active_entry = None;
+    }
+
     fn open_or_switch_worktree(
         &mut self,
         entry: &WorktreeEntry,
@@ -8496,15 +8791,27 @@ impl Sidebar {
     fn create_worktree_for_group(
         &mut self,
         group_key: &ProjectGroupKey,
+        branch_target: NewWorktreeBranchTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace_for_group(group_key, cx) else {
-            return;
-        };
+        if let Some(workspace) = self.workspace_for_group(group_key, cx) {
+            self.create_worktree_in_workspace(&workspace, branch_target, window, cx);
+        } else {
+            self.open_workspace_and_create_worktree(group_key, branch_target, window, cx);
+        }
+    }
+
+    fn create_worktree_in_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        branch_target: NewWorktreeBranchTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let action = CreateWorktree {
             worktree_name: None,
-            branch_target: NewWorktreeBranchTarget::CurrentBranch,
+            branch_target,
         };
         workspace.update(cx, |workspace, cx| {
             let focused_dock = workspace.focused_dock_position(window, cx);
@@ -8516,6 +8823,49 @@ impl Sidebar {
                 cx,
             );
         });
+    }
+
+    fn open_workspace_and_create_worktree(
+        &mut self,
+        project_group_key: &ProjectGroupKey,
+        branch_target: NewWorktreeBranchTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+
+        let path_list = project_group_key.path_list().clone();
+        let host = project_group_key.host();
+        let provisional_key = Some(project_group_key.clone());
+        let active_workspace = multi_workspace.read(cx).workspace().clone();
+        let modal_workspace = active_workspace.clone();
+
+        let task = multi_workspace.update(cx, |this, cx| {
+            this.find_or_create_workspace(
+                path_list,
+                host,
+                provisional_key,
+                |options, window, cx| connect_remote(active_workspace, options, window, cx),
+                &[],
+                None,
+                OpenMode::Activate,
+                window,
+                cx,
+            )
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            remote_connection::dismiss_connection_modal(&modal_workspace, cx);
+            let workspace = result?;
+            this.update_in(cx, |this, window, cx| {
+                this.create_worktree_in_workspace(&workspace, branch_target, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn remove_worktree(
@@ -8530,6 +8880,11 @@ impl Sidebar {
 
         let repository = entry.repository.clone();
         let path = entry.worktree.path.clone();
+        let open_workspace = self.workspace_for_worktree_path(&entry.group_key, entry.path(), cx);
+        let multi_workspace = self.multi_workspace.upgrade();
+        let switch_to_main_first = entry.is_current;
+        let group_key = entry.group_key.clone();
+        let main_worktree_path = entry.main_worktree_path.clone();
         let prompt = window.prompt(
             PromptLevel::Warning,
             "Remove Worktree?",
@@ -8542,6 +8897,52 @@ impl Sidebar {
             .spawn(cx, async move |cx| {
                 if prompt.await? != 0 {
                     return anyhow::Ok(());
+                }
+
+                if let (Some(multi_workspace), Some(open_workspace)) =
+                    (multi_workspace, open_workspace)
+                {
+                    let close_task = cx.update(|window, cx| {
+                        multi_workspace.update(cx, |multi_workspace, cx| {
+                            if switch_to_main_first {
+                                let active_workspace = multi_workspace.workspace().clone();
+                                let excluded_workspace = open_workspace.clone();
+                                let main_paths =
+                                    PathList::new(std::slice::from_ref(&main_worktree_path));
+                                multi_workspace.remove(
+                                    [open_workspace.clone()],
+                                    move |multi_workspace, window, cx| {
+                                        multi_workspace.find_or_create_workspace(
+                                            main_paths,
+                                            group_key.host(),
+                                            Some(group_key),
+                                            |options, window, cx| {
+                                                connect_remote(
+                                                    active_workspace,
+                                                    options,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                            std::slice::from_ref(&excluded_workspace),
+                                            None,
+                                            OpenMode::Activate,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            } else {
+                                multi_workspace.close_workspace(&open_workspace, window, cx)
+                            }
+                        })
+                    })?;
+
+                    if !close_task.await? {
+                        return anyhow::Ok(());
+                    }
                 }
 
                 let result = repository
@@ -8980,6 +9381,7 @@ impl Sidebar {
                     })),
             )
             .child(self.render_thread_grouping_button(cx))
+            .child(self.render_open_worktrees_only_button(cx))
             .child(div().flex_1())
             .child(self.render_recent_projects_button(cx))
     }
@@ -9001,6 +9403,28 @@ impl Sidebar {
                     ThreadGroupingMode::Project => ThreadGroupingMode::Worktree,
                     ThreadGroupingMode::Worktree => ThreadGroupingMode::Project,
                 };
+                this.serialize(cx);
+                this.update_entries(cx);
+            }))
+    }
+
+    fn render_open_worktrees_only_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_open_only = self.show_open_worktrees_only;
+        let tooltip_label = if show_open_only {
+            "Show All Worktrees"
+        } else {
+            "Show Open Worktrees Only"
+        };
+
+        IconButton::new("open-worktrees-only", IconName::Filter)
+            .icon_size(IconSize::Small)
+            .toggle_state(show_open_only)
+            .tooltip(Tooltip::text(tooltip_label))
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.show_open_worktrees_only = !this.show_open_worktrees_only;
+                if this.show_open_worktrees_only {
+                    this.thread_grouping = ThreadGroupingMode::Worktree;
+                }
                 this.serialize(cx);
                 this.update_entries(cx);
             }))
@@ -9356,6 +9780,7 @@ impl WorkspaceSidebar for Sidebar {
                 SidebarView::Archive(_) => SerializedSidebarView::History,
             },
             thread_grouping: self.thread_grouping,
+            show_open_worktrees_only: self.show_open_worktrees_only,
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -9371,6 +9796,7 @@ impl WorkspaceSidebar for Sidebar {
                 self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
             }
             self.thread_grouping = serialized.thread_grouping;
+            self.show_open_worktrees_only = serialized.show_open_worktrees_only;
             let restore_archive = serialized.active_view == SerializedSidebarView::History;
             cx.defer_in(window, move |this, window, cx| {
                 if restore_archive {
