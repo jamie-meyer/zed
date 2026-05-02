@@ -26,6 +26,7 @@ mod toast_layer;
 mod toolbar;
 pub mod welcome;
 mod workspace_settings;
+pub mod worktree_activity;
 
 pub use crate::notifications::NotificationFrame;
 pub use dock::Panel;

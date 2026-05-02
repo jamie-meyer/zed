@@ -144,6 +144,13 @@ pub enum Event {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalProcessInfo {
+    pub name: String,
+    pub cwd: PathBuf,
+    pub argv: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathLikeTarget {
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
@@ -2132,6 +2139,22 @@ impl Terminal {
             None
         } else {
             self.client_side_working_directory()
+        }
+    }
+
+    pub fn foreground_process_info(&self) -> Option<TerminalProcessInfo> {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => {
+                info.current
+                    .read()
+                    .as_ref()
+                    .map(|process| TerminalProcessInfo {
+                        name: process.name.clone(),
+                        cwd: process.cwd.clone(),
+                        argv: process.argv.clone(),
+                    })
+            }
+            TerminalType::DisplayOnly => None,
         }
     }
 
