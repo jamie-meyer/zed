@@ -2,11 +2,13 @@ use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use askpass::AskPassDelegate;
 use collections::HashSet;
 use fs::Fs;
+use futures::{FutureExt as _, StreamExt as _, select_biased, stream::FuturesUnordered};
 use gpui::{
     AsyncWindowContext, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
     Task, TaskExt, WeakEntity,
@@ -19,7 +21,8 @@ use remote::RemoteConnectionOptions;
 use settings::Settings;
 use ui::prelude::*;
 use workspace::{
-    MultiWorkspace, OpenMode, PreviousWorkspaceState, ToastView, Workspace, dock::DockPosition,
+    ActiveWorktreeCreationPhase, MultiWorkspace, OpenMode, PreviousWorkspaceState, ToastView,
+    Workspace, dock::DockPosition,
 };
 use zed_actions::NewWorktreeBranchTarget;
 
@@ -119,6 +122,12 @@ pub fn worktree_create_targets(
     }
     targets
 }
+
+const WORKTREE_CREATION_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKTREE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKTREE_WORKSPACE_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+const WORKTREE_INITIAL_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKTREE_REPOSITORY_BARRIER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Whether a worktree operation is creating a new one or switching to an
 /// existing one. Controls whether the source workspace's state (dock layout,
@@ -466,6 +475,7 @@ fn start_worktree_creations(
         futures::channel::oneshot::Receiver<anyhow::Result<()>>,
     )>,
     Vec<(PathBuf, PathBuf)>,
+    String,
 )> {
     let mut creation_infos = Vec::new();
     let mut path_remapping = Vec::new();
@@ -505,7 +515,7 @@ fn start_worktree_creations(
         }
     }
 
-    Ok((creation_infos, path_remapping))
+    Ok((creation_infos, path_remapping, worktree_name))
 }
 
 /// Waits for every in-flight worktree creation to complete. If any
@@ -521,23 +531,73 @@ pub async fn await_and_rollback_on_failure(
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut created_paths: Vec<PathBuf> = Vec::new();
-    let mut repos_and_paths: Vec<(Entity<Repository>, PathBuf)> = Vec::new();
+    let repos_and_paths: Vec<(Entity<Repository>, PathBuf)> = creation_infos
+        .iter()
+        .map(|(repo, path, _)| (repo.clone(), path.clone()))
+        .collect();
     let mut first_error: Option<anyhow::Error> = None;
 
-    for (repo, new_path, receiver) in creation_infos {
-        repos_and_paths.push((repo.clone(), new_path.clone()));
-        match receiver.await {
-            Ok(Ok(())) => {
-                created_paths.push(new_path);
-            }
-            Ok(Err(err)) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
+    let mut pending_creations = FuturesUnordered::new();
+    for (_repo, new_path, receiver) in creation_infos {
+        pending_creations.push(async move {
+            let result = match receiver.await {
+                Ok(result) => result,
+                Err(canceled) => Err(anyhow!("Worktree creation was canceled: {canceled}")),
+            };
+            (new_path, result)
+        });
+    }
+
+    let mut creation_timed_out = false;
+    if !pending_creations.is_empty() {
+        let creation_timeout = cx
+            .background_executor()
+            .timer(WORKTREE_CREATION_TIMEOUT)
+            .fuse();
+        futures::pin_mut!(creation_timeout);
+
+        loop {
+            select_biased! {
+                creation = pending_creations.next().fuse() => {
+                    let Some((new_path, result)) = creation else {
+                        break;
+                    };
+                    match result {
+                        Ok(()) => created_paths.push(new_path),
+                        Err(err) => {
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                }
+                _ = creation_timeout => {
+                    creation_timed_out = true;
+                    let paths = repos_and_paths
+                        .iter()
+                        .map(|(_, path)| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    first_error.get_or_insert_with(|| {
+                        anyhow!(
+                            "Timed out after {} seconds while creating worktrees: {paths}",
+                            WORKTREE_CREATION_TIMEOUT.as_secs()
+                        )
+                    });
+                    break;
                 }
             }
-            Err(_canceled) => {
-                if first_error.is_none() {
-                    first_error = Some(anyhow!("Worktree creation was canceled"));
+        }
+    }
+
+    if first_error.is_some() && !creation_timed_out {
+        while let Some((new_path, result)) = pending_creations.next().await {
+            match result {
+                Ok(()) => created_paths.push(new_path),
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
                 }
             }
         }
@@ -566,18 +626,37 @@ pub async fn await_and_rollback_on_failure(
         let mut git_remove_failed = false;
 
         if let Some(receiver) = receiver_opt {
-            match receiver.await {
-                Ok(Ok(())) => {}
-                Ok(Err(rollback_err)) => {
-                    log::error!(
-                        "git worktree remove failed for {}: {rollback_err}",
-                        path.display()
-                    );
-                    git_remove_failed = true;
+            let rollback = receiver.fuse();
+            let timeout = cx
+                .background_executor()
+                .timer(WORKTREE_ROLLBACK_TIMEOUT)
+                .fuse();
+            futures::pin_mut!(rollback);
+            futures::pin_mut!(timeout);
+            select_biased! {
+                result = rollback => {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(rollback_err)) => {
+                            log::error!(
+                                "git worktree remove failed for {}: {rollback_err}",
+                                path.display()
+                            );
+                            git_remove_failed = true;
+                        }
+                        Err(canceled) => {
+                            log::error!(
+                                "git worktree remove failed for {}: {canceled}",
+                                path.display()
+                            );
+                            git_remove_failed = true;
+                        }
+                    }
                 }
-                Err(canceled) => {
+                _ = timeout => {
                     log::error!(
-                        "git worktree remove failed for {}: {canceled}",
+                        "git worktree remove timed out after {} seconds for {}",
+                        WORKTREE_ROLLBACK_TIMEOUT.as_secs(),
                         path.display()
                     );
                     git_remove_failed = true;
@@ -768,8 +847,8 @@ fn create_worktree_workspace_inner(
     // a hard error here so the caller can surface it; the user-facing
     // wrapper [`handle_create_worktree`] swallows the error via
     // `detach_and_log_err`, matching the pre-existing silent return.
-    if workspace.active_worktree_creation().label.is_some() {
-        return Task::ready(Err(anyhow!("A worktree creation is already in progress")));
+    if workspace.has_active_worktree_operation() {
+        return Task::ready(Err(anyhow!("A worktree operation is already in progress")));
     }
 
     let previous_state =
@@ -837,7 +916,7 @@ fn create_worktree_workspace_inner(
         .to_string()
         .into();
 
-    workspace.set_active_worktree_creation(Some(display_name), false, cx);
+    let operation_id = workspace.start_active_worktree_creation(display_name, false, cx);
 
     cx.spawn_in(window, async move |_workspace_entity, mut cx| {
         let result = do_create_worktree(
@@ -852,6 +931,7 @@ fn create_worktree_workspace_inner(
             window_handle,
             remote_connection_options,
             activate,
+            operation_id,
             &mut cx,
         )
         .await;
@@ -860,7 +940,7 @@ fn create_worktree_workspace_inner(
             log::error!("Failed to create worktree: {err}");
             workspace_handle
                 .update(cx, |workspace, cx| {
-                    workspace.set_active_worktree_creation(None, false, cx);
+                    workspace.clear_active_worktree_creation(operation_id, cx);
                     if let Some(fetch_error) = err.downcast_ref::<WorktreeFetchError>() {
                         let toast = cx.new(|cx| {
                             WorktreeFetchFailedToast::new(
@@ -902,8 +982,13 @@ pub fn handle_switch_worktree(
         return;
     }
 
-    // Guard against concurrent creation
-    if workspace.active_worktree_creation().label.is_some() {
+    if workspace.has_active_worktree_operation() {
+        show_error_toast(
+            cx.entity(),
+            "worktree switch",
+            anyhow!("A worktree operation is already in progress"),
+            cx,
+        );
         return;
     }
 
@@ -922,7 +1007,7 @@ pub fn handle_switch_worktree(
 
     let display_name: SharedString = action.display_name.clone().into();
 
-    workspace.set_active_worktree_creation(Some(display_name), true, cx);
+    let operation_id = workspace.start_active_worktree_creation(display_name, true, cx);
 
     let worktree_path = action.path.clone();
 
@@ -935,6 +1020,7 @@ pub fn handle_switch_worktree(
             workspace_handle.clone(),
             window_handle,
             remote_connection_options,
+            operation_id,
             &mut cx,
         )
         .await;
@@ -943,7 +1029,7 @@ pub fn handle_switch_worktree(
             log::error!("Failed to switch worktree: {err}");
             workspace_handle
                 .update(cx, |workspace, cx| {
-                    workspace.set_active_worktree_creation(None, false, cx);
+                    workspace.clear_active_worktree_creation(operation_id, cx);
                     show_error_toast(cx.entity(), "worktree switch", anyhow!("{err:#}"), cx);
                 })
                 .ok();
@@ -966,6 +1052,7 @@ async fn do_create_worktree(
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
     activate: bool,
+    operation_id: u64,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
     // List existing worktrees from all repos to detect name collisions
@@ -1002,7 +1089,9 @@ async fn do_create_worktree(
             Ok(Err(err)) => {
                 Err::<(), _>(err).log_err();
             }
-            Err(_) => {}
+            Err(canceled) => {
+                log::warn!("git worktree list request was canceled: {canceled}");
+            }
         }
     }
 
@@ -1032,7 +1121,7 @@ async fn do_create_worktree(
 
     let base_ref = resolve_worktree_branch_target(&branch_target);
 
-    let (creation_infos, path_remapping) = cx.update(|_, cx| {
+    let (creation_infos, path_remapping, resolved_worktree_name) = cx.update(|_, cx| {
         start_worktree_creations(
             &git_repos,
             worktree_name,
@@ -1044,6 +1133,17 @@ async fn do_create_worktree(
             cx,
         )
     })??;
+
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.update_active_worktree_creation(
+                operation_id,
+                Some(resolved_worktree_name.into()),
+                None,
+                cx,
+            );
+        })
+        .ok();
 
     let fs = cx.update(|_, cx| <dyn Fs>::global(cx))?;
 
@@ -1073,6 +1173,17 @@ async fn do_create_worktree(
     // repository and `start_worktree_creations` consolidated them.
     let consolidated_worktrees = path_remapping.len() > created_paths.len();
 
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.update_active_worktree_creation(
+                operation_id,
+                None,
+                Some(ActiveWorktreeCreationPhase::Loading),
+                cx,
+            );
+        })
+        .ok();
+
     let mut all_paths = created_paths;
     let has_non_git = !non_git_paths.is_empty();
     all_paths.extend(non_git_paths.iter().cloned());
@@ -1088,6 +1199,7 @@ async fn do_create_worktree(
         remote_connection_options,
         WorktreeOperation::Create,
         activate,
+        operation_id,
         cx,
     )
     .await?;
@@ -1106,6 +1218,7 @@ async fn do_switch_worktree(
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
+    operation_id: u64,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
     let path_remapping: Vec<(PathBuf, PathBuf)> = git_repo_work_dirs
@@ -1129,9 +1242,86 @@ async fn do_switch_worktree(
         WorktreeOperation::Switch,
         // Switching is always an explicit, foreground user action.
         true,
+        operation_id,
         cx,
     )
     .await
+}
+
+async fn wait_for_initial_scan_or_timeout(
+    workspace: &Entity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) {
+    let wait_for_scan = workspace
+        .update(cx, |workspace, cx| {
+            workspace.project().read(cx).wait_for_initial_scan(cx)
+        })
+        .fuse();
+    let timeout = cx
+        .background_executor()
+        .timer(WORKTREE_INITIAL_SCAN_TIMEOUT)
+        .fuse();
+    futures::pin_mut!(wait_for_scan);
+    futures::pin_mut!(timeout);
+
+    select_biased! {
+        _ = wait_for_scan => {}
+        _ = timeout => {
+            log::warn!(
+                "timed out after {} seconds waiting for worktree initial scan",
+                WORKTREE_INITIAL_SCAN_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
+async fn wait_for_repository_barriers_or_timeout(
+    workspace: &Entity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) {
+    let barriers = workspace.update(cx, |workspace, cx| {
+        let repos = workspace
+            .project()
+            .read(cx)
+            .repositories(cx)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        repos
+            .into_iter()
+            .map(|repo| repo.update(cx, |repo, _| repo.barrier()))
+            .collect::<Vec<_>>()
+    });
+
+    if barriers.is_empty() {
+        return;
+    }
+
+    let wait_for_barriers = async move {
+        for result in futures::future::join_all(barriers).await {
+            if let Err(err) = result {
+                log::warn!("git repository barrier was canceled: {err}");
+            }
+        }
+    }
+    .fuse();
+    let timeout = cx
+        .background_executor()
+        .timer(WORKTREE_REPOSITORY_BARRIER_TIMEOUT)
+        .fuse();
+    futures::pin_mut!(wait_for_barriers);
+    futures::pin_mut!(timeout);
+
+    select_biased! {
+        _ = wait_for_barriers => {}
+        _ = timeout => {
+            log::warn!(
+                "timed out after {} seconds waiting for worktree repository barriers",
+                WORKTREE_REPOSITORY_BARRIER_TIMEOUT.as_secs()
+            );
+        }
+    }
 }
 
 /// Core workspace opening logic shared by both create and switch flows.
@@ -1148,6 +1338,7 @@ async fn open_worktree_workspace(
     remote_connection_options: Option<RemoteConnectionOptions>,
     operation: WorktreeOperation,
     activate: bool,
+    operation_id: u64,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
     let window_handle = window_handle
@@ -1216,38 +1407,45 @@ async fn open_worktree_workspace(
             (task, modal_workspace)
         })?;
 
-    let result = workspace_task.await;
+    let workspace_task = workspace_task.fuse();
+    let workspace_open_timeout = cx
+        .background_executor()
+        .timer(WORKTREE_WORKSPACE_OPEN_TIMEOUT)
+        .fuse();
+    futures::pin_mut!(workspace_task);
+    futures::pin_mut!(workspace_open_timeout);
+    let result = select_biased! {
+        result = workspace_task => result,
+        _ = workspace_open_timeout => {
+            workspace
+                .update(cx, |ws, cx| {
+                    ws.clear_active_worktree_creation(operation_id, cx);
+                })
+                .ok();
+            log::warn!(
+                "timed out after {} seconds waiting for worktree workspace to open",
+                WORKTREE_WORKSPACE_OPEN_TIMEOUT.as_secs()
+            );
+            workspace_task.await
+        }
+    };
     remote_connection::dismiss_connection_modal(&modal_workspace, cx);
     let new_workspace = result?;
+
+    workspace
+        .update(cx, |ws, cx| {
+            ws.hide_active_worktree_creation(operation_id, cx);
+        })
+        .ok();
 
     let panels_task = new_workspace.update(cx, |workspace, _cx| workspace.take_panels_task());
 
     if let Some(task) = panels_task {
-        task.await.log_err();
+        cx.update(|_, cx| task.detach_and_log_err(cx)).ok();
     }
 
-    new_workspace
-        .update(cx, |workspace, cx| {
-            workspace.project().read(cx).wait_for_initial_scan(cx)
-        })
-        .await;
-
-    new_workspace
-        .update(cx, |workspace, cx| {
-            let repos = workspace
-                .project()
-                .read(cx)
-                .repositories(cx)
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-
-            let tasks = repos
-                .into_iter()
-                .map(|repo| repo.update(cx, |repo, _| repo.barrier()));
-            futures::future::join_all(tasks)
-        })
-        .await;
+    wait_for_initial_scan_or_timeout(&new_workspace, cx).await;
+    wait_for_repository_barriers_or_timeout(&new_workspace, cx).await;
 
     maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
 
@@ -1341,14 +1539,6 @@ async fn open_worktree_workspace(
         })?;
     }
 
-    // Clear the creation status on the SOURCE workspace so its title bar
-    // stops showing the loading indicator immediately.
-    workspace
-        .update(cx, |ws, cx| {
-            ws.set_active_worktree_creation(None, false, cx);
-        })
-        .ok();
-
     window_handle.update(cx, |multi_workspace, window, cx| {
         if activate {
             multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
@@ -1373,6 +1563,12 @@ async fn open_worktree_workspace(
             });
         }
     })?;
+
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.clear_active_worktree_creation(operation_id, cx);
+        })
+        .ok();
 
     Ok(new_workspace)
 }
