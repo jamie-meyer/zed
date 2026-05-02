@@ -30,6 +30,7 @@ use std::{
     future,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use sum_tree::MapSeekTarget;
 use thiserror::Error;
@@ -59,6 +60,7 @@ pub const GRAPH_CHUNK_SIZE: usize = 1000;
 
 /// Default value for the `git.worktree_directory` setting.
 pub const DEFAULT_WORKTREE_DIRECTORY: &str = "../worktrees";
+const GIT_WORKTREE_ADD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Determine the original (main) repository's working directory.
 ///
@@ -1899,7 +1901,21 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
                 let git = git_binary?;
-                let output = git.build_command(&args).output().await?;
+                let mut command = git.build_command(&args);
+                command.kill_on_drop(true);
+                let output = command.output().fuse();
+                let mut timeout = git.executor.timer(GIT_WORKTREE_ADD_TIMEOUT).fuse();
+                futures::pin_mut!(output);
+                let output = select_biased! {
+                    output = output => output?,
+                    _ = timeout => {
+                        anyhow::bail!(
+                            "git worktree add timed out after {} seconds for {}",
+                            GIT_WORKTREE_ADD_TIMEOUT.as_secs(),
+                            path.display()
+                        );
+                    }
+                };
                 if output.status.success() {
                     Ok(())
                 } else {

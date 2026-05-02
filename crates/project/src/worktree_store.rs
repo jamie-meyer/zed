@@ -321,9 +321,10 @@ impl WorktreeStore {
     /// and no worktree creations are pending, and updates the watch channel accordingly.
     fn update_initial_scan_state(&mut self, cx: &App) {
         let complete = self.loading_worktrees.is_empty()
-            && self
-                .visible_worktrees(cx)
-                .all(|wt| wt.read(cx).completed_scan_id() >= 1);
+            && self.visible_worktrees(cx).all(|wt| {
+                let worktree = wt.read(cx);
+                worktree.completed_scan_id() >= 1 || worktree.is_disconnected()
+            });
         *self.initial_scan_complete.0.borrow_mut() = complete;
     }
 
@@ -336,7 +337,7 @@ impl WorktreeStore {
     ) {
         let await_scan = worktree.update(cx, |worktree, _cx| worktree.wait_for_snapshot(1));
         cx.spawn(async move |this, cx| {
-            await_scan.await.ok();
+            await_scan.await.log_err();
             this.update(cx, |this, cx| {
                 this.update_initial_scan_state(cx);
             })
@@ -1087,6 +1088,7 @@ impl WorktreeStore {
                 });
             }
         }
+        self.update_initial_scan_state(cx);
     }
 
     pub fn send_project_updates(&mut self, cx: &mut Context<Self>) {
@@ -1394,5 +1396,68 @@ impl WorktreeHandle {
             WorktreeHandle::Strong(handle) => Some(handle.clone()),
             WorktreeHandle::Weak(handle) => handle.upgrade(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use gpui::TestAppContext;
+    use rpc::NoopProtoClient;
+    use settings::{Settings, SettingsStore};
+
+    #[gpui::test]
+    async fn disconnected_remote_worktree_completes_initial_scan(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            worktree::WorktreeSettings::register(cx);
+        });
+
+        let client = AnyProtoClient::new(NoopProtoClient::new());
+        let store = cx.update(|cx| {
+            cx.new(|cx| {
+                WorktreeStore::remote(
+                    false,
+                    client.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    PathStyle::Posix,
+                    WorktreeIdCounter::get(cx),
+                )
+            })
+        });
+
+        let worktree = cx.update(|cx| {
+            Worktree::remote(
+                REMOTE_SERVER_PROJECT_ID,
+                ReplicaId::new(1),
+                proto::WorktreeMetadata {
+                    id: 1,
+                    root_name: "project".to_string(),
+                    visible: true,
+                    abs_path: "/home/user/project".to_string(),
+                    root_repo_common_dir: None,
+                },
+                client,
+                PathStyle::Posix,
+                cx,
+            )
+        });
+
+        store.update(cx, |store, cx| {
+            store.add(&worktree, cx);
+            *store.initial_scan_complete.0.borrow_mut() = false;
+        });
+
+        let wait_for_initial_scan = store.read_with(cx, |store, _cx| store.wait_for_initial_scan());
+
+        store.update(cx, |store, cx| {
+            store.disconnected_from_host(cx);
+        });
+
+        wait_for_initial_scan.await;
+
+        assert!(store.read_with(cx, |store, _cx| store.initial_scan_completed()));
     }
 }

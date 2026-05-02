@@ -1,4 +1,4 @@
-use std::process::ExitStatus;
+use std::{process::ExitStatus, time::Duration};
 
 use anyhow::Result;
 use collections::HashSet;
@@ -14,6 +14,9 @@ use ui::Window;
 use util::TryFutureExt;
 
 use crate::{SaveIntent, Toast, Workspace, notifications::NotificationId};
+
+const CREATE_WORKTREE_TASK_TERMINAL_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
+const CREATE_WORKTREE_TASK_TERMINAL_PROVIDER_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 impl Workspace {
     pub fn schedule_task(
@@ -232,6 +235,24 @@ impl Workspace {
         }
 
         let task = cx.spawn_in(window, async move |workspace, cx| {
+            let mut waited_for_terminal_provider = Duration::ZERO;
+            while !workspace
+                .read_with(cx, |workspace, _cx| workspace.terminal_provider.is_some())
+                .unwrap_or(false)
+            {
+                if waited_for_terminal_provider >= CREATE_WORKTREE_TASK_TERMINAL_PROVIDER_TIMEOUT {
+                    log::error!(
+                        "Git worktree setup tasks were not run because the terminal provider was unavailable"
+                    );
+                    return anyhow::Ok(());
+                }
+
+                cx.background_executor()
+                    .timer(CREATE_WORKTREE_TASK_TERMINAL_PROVIDER_RETRY_INTERVAL)
+                    .await;
+                waited_for_terminal_provider += CREATE_WORKTREE_TASK_TERMINAL_PROVIDER_RETRY_INTERVAL;
+            }
+
             let mut tasks = Vec::new();
             for (worktree_id, task_context, templates) in worktree_tasks {
                 let id_base = format!("worktree_setup_{worktree_id}");
@@ -250,20 +271,24 @@ impl Workspace {
                                 workspace.spawn_in_terminal(resolved.resolved, window, cx)
                             })?;
 
-                            if let Some(result) = status.await {
-                                match result {
-                                    Ok(exit_status) if !exit_status.success() => {
-                                        log::error!(
-                                            "Git worktree setup task failed with status: {:?}",
-                                            exit_status.code()
-                                        );
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        log::error!("Git worktree setup task error: {error:#}");
-                                        break;
-                                    }
-                                    _ => {}
+                            match status.await {
+                                Some(Ok(exit_status)) if !exit_status.success() => {
+                                    log::error!(
+                                        "Git worktree setup task failed with status: {:?}",
+                                        exit_status.code()
+                                    );
+                                    break;
+                                }
+                                Some(Err(error)) => {
+                                    log::error!("Git worktree setup task error: {error:#}");
+                                    break;
+                                }
+                                Some(Ok(_)) => {}
+                                None => {
+                                    log::error!(
+                                        "Git worktree setup task could not spawn because the terminal provider was unavailable"
+                                    );
+                                    break;
                                 }
                             }
                         }

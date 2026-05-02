@@ -1110,12 +1110,19 @@ struct GlobalAppState(Arc<AppState>);
 
 impl Global for GlobalAppState {}
 
-/// Tracks worktree creation progress for the workspace.
-/// Read by the title bar to show a loading indicator on the worktree button.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActiveWorktreeCreationPhase {
+    #[default]
+    Creating,
+    Loading,
+}
+
 #[derive(Default)]
 pub struct ActiveWorktreeCreation {
+    pub id: Option<u64>,
     pub label: Option<SharedString>,
     pub is_switch: bool,
+    pub phase: ActiveWorktreeCreationPhase,
 }
 
 /// Captured workspace state used when switching between worktrees.
@@ -1397,6 +1404,7 @@ pub struct Workspace {
     sidebar_focus_handle: Option<FocusHandle>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     active_worktree_creation: ActiveWorktreeCreation,
+    next_worktree_creation_id: u64,
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
 }
 
@@ -1827,6 +1835,7 @@ impl Workspace {
             sidebar_focus_handle: None,
             multi_workspace,
             active_worktree_creation: ActiveWorktreeCreation::default(),
+            next_worktree_creation_id: 0,
             open_in_dev_container: false,
             _dev_container_task: None,
             deferred_save_items: Vec::new(),
@@ -2224,14 +2233,90 @@ impl Workspace {
         &self.active_worktree_creation
     }
 
+    pub fn has_active_worktree_operation(&self) -> bool {
+        self.active_worktree_creation.id.is_some()
+    }
+
+    pub fn start_active_worktree_creation(
+        &mut self,
+        label: SharedString,
+        is_switch: bool,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.next_worktree_creation_id = self.next_worktree_creation_id.wrapping_add(1);
+        let id = self.next_worktree_creation_id;
+        self.active_worktree_creation = ActiveWorktreeCreation {
+            id: Some(id),
+            label: Some(label),
+            is_switch,
+            phase: if is_switch {
+                ActiveWorktreeCreationPhase::Loading
+            } else {
+                ActiveWorktreeCreationPhase::Creating
+            },
+        };
+        cx.emit(Event::WorktreeCreationChanged);
+        cx.notify();
+        id
+    }
+
+    pub fn update_active_worktree_creation(
+        &mut self,
+        id: u64,
+        label: Option<SharedString>,
+        phase: Option<ActiveWorktreeCreationPhase>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.active_worktree_creation.id != Some(id) {
+            return false;
+        }
+
+        if let Some(label) = label {
+            self.active_worktree_creation.label = Some(label);
+        }
+        if let Some(phase) = phase {
+            self.active_worktree_creation.phase = phase;
+        }
+
+        cx.emit(Event::WorktreeCreationChanged);
+        cx.notify();
+        true
+    }
+
+    pub fn hide_active_worktree_creation(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        if self.active_worktree_creation.id != Some(id) {
+            return false;
+        }
+
+        self.active_worktree_creation.label = None;
+        cx.emit(Event::WorktreeCreationChanged);
+        cx.notify();
+        true
+    }
+
+    pub fn clear_active_worktree_creation(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        if self.active_worktree_creation.id != Some(id) {
+            return false;
+        }
+
+        self.active_worktree_creation = ActiveWorktreeCreation::default();
+        cx.emit(Event::WorktreeCreationChanged);
+        cx.notify();
+        true
+    }
+
     pub fn set_active_worktree_creation(
         &mut self,
         label: Option<SharedString>,
         is_switch: bool,
         cx: &mut Context<Self>,
     ) {
-        self.active_worktree_creation.label = label;
-        self.active_worktree_creation.is_switch = is_switch;
+        if let Some(label) = label {
+            self.start_active_worktree_creation(label, is_switch, cx);
+            return;
+        }
+
+        self.active_worktree_creation = ActiveWorktreeCreation::default();
         cx.emit(Event::WorktreeCreationChanged);
         cx.notify();
     }

@@ -712,6 +712,13 @@ impl Worktree {
         }
     }
 
+    pub fn is_disconnected(&self) -> bool {
+        match self {
+            Worktree::Local(_) => false,
+            Worktree::Remote(worktree) => worktree.disconnected,
+        }
+    }
+
     pub fn is_visible(&self) -> bool {
         match self {
             Worktree::Local(worktree) => worktree.visible,

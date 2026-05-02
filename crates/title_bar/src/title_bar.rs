@@ -895,21 +895,24 @@ impl TitleBar {
 
         let worktree_label: SharedString = linked_worktree_name.unwrap_or_else(|| "main".into());
 
-        let (creation_in_progress, is_switch) = self
+        let (creation_in_progress, creation_phase) = self
             .workspace
             .upgrade()
             .map(|ws| {
                 let creation = ws.read(cx).active_worktree_creation();
-                (creation.label.clone(), creation.is_switch)
+                (creation.label.clone(), creation.phase)
             })
-            .unwrap_or((None, false));
+            .unwrap_or_default();
         let is_creating = creation_in_progress.is_some();
 
         let display_label: SharedString = if let Some(ref name) = creation_in_progress {
-            if is_switch {
-                format!("Loading {}…", name).into()
-            } else {
-                format!("Creating {}…", name).into()
+            match creation_phase {
+                workspace::ActiveWorktreeCreationPhase::Creating => {
+                    format!("Creating {}…", name).into()
+                }
+                workspace::ActiveWorktreeCreationPhase::Loading => {
+                    format!("Loading {}…", name).into()
+                }
             }
         } else {
             worktree_label.clone()
