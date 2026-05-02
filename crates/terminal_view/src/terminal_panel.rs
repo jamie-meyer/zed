@@ -749,6 +749,29 @@ impl TerminalPanel {
         })
     }
 
+    pub(crate) fn activate_terminal_item(
+        &self,
+        terminal_view: &Entity<TerminalView>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let item_id = terminal_view.entity_id();
+        for pane in self.center.panes() {
+            let Some(item_index) = pane
+                .read(cx)
+                .items()
+                .position(|item| item.item_id() == item_id)
+            else {
+                continue;
+            };
+
+            self.activate_terminal_view(pane, item_index, focus, window, cx);
+            return true;
+        }
+        false
+    }
+
     pub fn add_center_terminal(
         workspace: &mut Workspace,
         window: &mut Window,

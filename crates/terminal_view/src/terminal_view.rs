@@ -35,7 +35,8 @@ use task::TaskId;
 use terminal::{
     Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, Paste, PasteText, Point, Range,
     ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
+    Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds,
+    TerminalProcessInfo, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -57,6 +58,10 @@ use workspace::{
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
+    },
+    worktree_activity::{
+        FocusWorktreeActivitySource, WorktreeActivityKey, WorktreeActivityStatus,
+        WorktreeActivityStore, WorktreeActivityUpdate,
     },
 };
 use zed_actions::{agent::AddSelectionToThread, assistant::InlineAssist};
@@ -150,6 +155,8 @@ pub struct TerminalView {
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
     self_handle: WeakEntity<Self>,
+    tracked_agent_label: Option<SharedString>,
+    worktree_activity_generation: u64,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -253,6 +260,7 @@ impl TerminalView {
         let cursor_shape = TerminalSettings::get_global(cx).cursor_shape;
 
         let scroll_handle = TerminalScrollHandle::new(terminal.read(cx));
+        let source_id = cx.entity_id();
 
         let blink_manager = cx.new(|cx| {
             BlinkManager::new(
@@ -270,6 +278,14 @@ impl TerminalView {
         let subscriptions = vec![
             focus_in,
             focus_out,
+            cx.on_release(move |terminal_view, cx| {
+                terminal_view.tracked_agent_label = None;
+                terminal_view.worktree_activity_generation =
+                    terminal_view.worktree_activity_generation.wrapping_add(1);
+                WorktreeActivityStore::global(cx).update(cx, |store, cx| {
+                    store.remove_source(source_id, cx);
+                });
+            }),
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
         ];
@@ -296,6 +312,8 @@ impl TerminalView {
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
+            tracked_agent_label: None,
+            worktree_activity_generation: 0,
             rename_editor: None,
             rename_editor_subscription: None,
             _subscriptions: subscriptions,
@@ -313,6 +331,169 @@ impl TerminalView {
             max_lines_when_unfocused,
         };
         cx.notify();
+    }
+
+    fn sync_worktree_activity(&mut self, status: WorktreeActivityStatus, cx: &mut Context<Self>) {
+        let process_info = self.terminal.read(cx).foreground_process_info();
+        let Some((agent_label, cwd)) = process_info.and_then(|process_info| {
+            known_terminal_agent(&process_info).map(|agent_label| {
+                let cwd = if process_info.cwd.as_os_str().is_empty() {
+                    self.terminal
+                        .read(cx)
+                        .working_directory()
+                        .unwrap_or(process_info.cwd)
+                } else {
+                    process_info.cwd
+                };
+                (agent_label, cwd)
+            })
+        }) else {
+            self.mark_worktree_activity_finished(cx);
+            return;
+        };
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            self.mark_worktree_activity_finished(cx);
+            return;
+        };
+        let Some(project) = self.project.upgrade() else {
+            self.mark_worktree_activity_finished(cx);
+            return;
+        };
+        let Some((worktree, _)) = project.read(cx).find_worktree(&cwd, cx) else {
+            self.mark_worktree_activity_finished(cx);
+            return;
+        };
+
+        let project_group_key = workspace.read(cx).project_group_key(cx);
+        let worktree_path = worktree.read(cx).abs_path().to_path_buf();
+        let key = WorktreeActivityKey {
+            project_group_key,
+            worktree_path,
+        };
+        let focus_source = self.worktree_activity_focus_source();
+        let source_label = self.worktree_activity_source_label(cx);
+        let source_id = cx.entity_id();
+        self.tracked_agent_label = Some(agent_label.clone());
+
+        WorktreeActivityStore::global(cx).update(cx, |store, cx| {
+            store.update_activity(
+                WorktreeActivityUpdate {
+                    source_id,
+                    key,
+                    agent_label,
+                    source_label,
+                    status,
+                    focus_source,
+                },
+                cx,
+            );
+        });
+
+        if status == WorktreeActivityStatus::Working {
+            self.schedule_worktree_activity_idle(cx);
+        }
+    }
+
+    fn mark_worktree_activity_finished(&mut self, cx: &mut Context<Self>) {
+        if self.tracked_agent_label.take().is_none() {
+            return;
+        }
+
+        self.worktree_activity_generation = self.worktree_activity_generation.wrapping_add(1);
+        let source_id = cx.entity_id();
+        WorktreeActivityStore::global(cx).update(cx, |store, cx| {
+            store.mark_finished(source_id, cx);
+        });
+    }
+
+    fn mark_worktree_activity_attention(&mut self, cx: &mut Context<Self>) {
+        if self.tracked_agent_label.is_none() {
+            return;
+        }
+
+        let source_id = cx.entity_id();
+        WorktreeActivityStore::global(cx).update(cx, |store, cx| {
+            store.mark_attention(source_id, cx);
+        });
+    }
+
+    fn acknowledge_worktree_activity(&mut self, cx: &mut Context<Self>) {
+        let source_id = cx.entity_id();
+        let still_running = self.tracked_agent_label.is_some();
+        WorktreeActivityStore::global(cx).update(cx, |store, cx| {
+            store.acknowledge_source(source_id, still_running, cx);
+        });
+    }
+
+    fn worktree_activity_focus_source(&self) -> FocusWorktreeActivitySource {
+        let workspace = self.workspace.clone();
+        let terminal_view = self.self_handle.clone();
+        Rc::new(move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return false;
+            };
+            let Some(terminal_view) = terminal_view.upgrade() else {
+                return false;
+            };
+
+            let multi_workspace = workspace
+                .read(cx)
+                .multi_workspace()
+                .cloned()
+                .and_then(|multi_workspace| multi_workspace.upgrade());
+            if let Some(multi_workspace) = multi_workspace {
+                multi_workspace.update(cx, |multi_workspace, cx| {
+                    multi_workspace.activate(workspace.clone(), None, window, cx);
+                });
+            }
+
+            if workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&terminal_view, true, true, window, cx)
+            }) {
+                return true;
+            }
+
+            let terminal_panel = workspace.read(cx).panel::<TerminalPanel>(cx);
+            if let Some(terminal_panel) = terminal_panel
+                && terminal_panel.update(cx, |panel, cx| {
+                    panel.activate_terminal_item(&terminal_view, true, window, cx)
+                })
+            {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.focus_panel::<TerminalPanel>(window, cx);
+                });
+                return true;
+            }
+            false
+        })
+    }
+
+    fn worktree_activity_source_label(&self, cx: &App) -> SharedString {
+        self.custom_title
+            .as_ref()
+            .filter(|title| !title.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.terminal.read(cx).title(true))
+            .into()
+    }
+
+    fn schedule_worktree_activity_idle(&mut self, cx: &mut Context<Self>) {
+        self.worktree_activity_generation = self.worktree_activity_generation.wrapping_add(1);
+        let generation = self.worktree_activity_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |this, cx| {
+                if this.worktree_activity_generation == generation {
+                    let source_id = cx.entity_id();
+                    WorktreeActivityStore::global(cx).update(cx, |store, cx| {
+                        store.mark_running(source_id, cx);
+                    });
+                }
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     const MAX_EMBEDDED_LINES: usize = 1_000;
@@ -1077,6 +1258,32 @@ fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
     }
 }
 
+fn known_terminal_agent(process_info: &TerminalProcessInfo) -> Option<SharedString> {
+    process_info
+        .argv
+        .first()
+        .and_then(|command| known_terminal_agent_command(command))
+        .or_else(|| known_terminal_agent_command(&process_info.name))
+}
+
+fn known_terminal_agent_command(command: &str) -> Option<SharedString> {
+    let basename = Path::new(command)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| command.to_string())
+        .to_ascii_lowercase();
+    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
+
+    match basename {
+        "codex" => Some("Codex".into()),
+        "claude" | "claude-code" => Some("Claude".into()),
+        "aider" => Some("Aider".into()),
+        "opencode" => Some("OpenCode".into()),
+        "gemini" => Some("Gemini".into()),
+        _ => None,
+    }
+}
+
 fn subscribe_for_terminal_events(
     terminal: &Entity<Terminal>,
     workspace: WeakEntity<Workspace>,
@@ -1097,6 +1304,7 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
+                    terminal_view.sync_worktree_activity(WorktreeActivityStatus::Working, cx);
                     cx.notify();
                     cx.emit(Event::Wakeup);
                     cx.emit(ItemEvent::UpdateTab);
@@ -1105,6 +1313,9 @@ fn subscribe_for_terminal_events(
 
                 Event::Bell => {
                     terminal_view.has_bell = true;
+                    if !terminal_view.focus_handle.is_focused(window) {
+                        terminal_view.mark_worktree_activity_attention(cx);
+                    }
                     if let TerminalBell::System = TerminalSettings::get_global(cx).bell {
                         window.play_system_bell();
                     }
@@ -1131,6 +1342,7 @@ fn subscribe_for_terminal_events(
                 }
 
                 Event::TitleChanged => {
+                    terminal_view.sync_worktree_activity(WorktreeActivityStatus::Running, cx);
                     cx.emit(ItemEvent::UpdateTab);
                 }
 
@@ -1261,6 +1473,7 @@ impl TerminalView {
             terminal.set_cursor_shape(self.cursor_shape);
             terminal.focus_in();
         });
+        self.acknowledge_worktree_activity(cx);
 
         let should_blink = match TerminalSettings::get_global(cx).blinking {
             TerminalBlink::Off => false,
@@ -1802,6 +2015,13 @@ impl Item for TerminalView {
         }
     }
 
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        let source_id = cx.entity_id();
+        WorktreeActivityStore::global(cx).update(cx, |store, cx| {
+            store.remove_source(source_id, cx);
+        });
+    }
+
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         f(*event)
     }
@@ -2140,6 +2360,23 @@ mod tests {
     use util::rel_path::RelPath;
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
+
+    #[test]
+    fn test_known_terminal_agent_command_detection() {
+        assert_eq!(
+            known_terminal_agent_command("codex").as_deref(),
+            Some("Codex")
+        );
+        assert_eq!(
+            known_terminal_agent_command("/usr/local/bin/claude").as_deref(),
+            Some("Claude")
+        );
+        assert_eq!(
+            known_terminal_agent_command("aider.exe").as_deref(),
+            Some("Aider")
+        );
+        assert!(known_terminal_agent_command("bash").is_none());
+    }
 
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();

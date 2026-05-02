@@ -28,6 +28,7 @@ mod toolbar;
 pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
+pub mod worktree_activity;
 
 pub use dock::Panel;
 pub use multi_workspace::{
