@@ -12,8 +12,8 @@ use db::kvp::KeyValueStore;
 use futures::{channel::oneshot, future::join_all};
 use gpui::{
     Action, Anchor, AnyView, App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, WeakEntity,
-    Window, actions,
+    FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt,
+    WeakEntity, Window, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project};
@@ -747,6 +747,29 @@ impl TerminalPanel {
         pane.update(cx, |pane, cx| {
             pane.activate_item(item_index, true, focus, window, cx)
         })
+    }
+
+    pub(crate) fn activate_terminal_item(
+        &self,
+        terminal_view: &Entity<TerminalView>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let item_id = terminal_view.entity_id();
+        for pane in self.center.panes() {
+            let Some(item_index) = pane
+                .read(cx)
+                .items()
+                .position(|item| item.item_id() == item_id)
+            else {
+                continue;
+            };
+
+            self.activate_terminal_view(pane, item_index, focus, window, cx);
+            return true;
+        }
+        false
     }
 
     pub fn add_center_terminal(
@@ -1539,11 +1562,7 @@ impl Focusable for TerminalPanel {
 
 impl Panel for TerminalPanel {
     fn position(&self, _window: &Window, cx: &App) -> DockPosition {
-        match TerminalSettings::get_global(cx).dock {
-            TerminalDockPosition::Left => DockPosition::Left,
-            TerminalDockPosition::Bottom => DockPosition::Bottom,
-            TerminalDockPosition::Right => DockPosition::Right,
-        }
+        TerminalSettings::get_global(cx).dock.into()
     }
 
     fn position_is_valid(&self, _: DockPosition) -> bool {
@@ -1669,6 +1688,12 @@ impl Panel for TerminalPanel {
 
     fn activation_priority(&self) -> u32 {
         2
+    }
+
+    fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
+        Some(workspace::HideStatusItem::new(|settings| {
+            settings.terminal.get_or_insert_default().button = Some(false);
+        }))
     }
 }
 
