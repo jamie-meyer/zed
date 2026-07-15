@@ -2008,6 +2008,9 @@ impl AgentPanel {
         if !self.supports_terminal(cx) {
             return;
         }
+        if self.pending_terminal_spawn.is_some() {
+            return;
+        }
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
         let working_directory = self.terminal_working_directory(workspace, cx);
         self.spawn_terminal(
@@ -7429,6 +7432,31 @@ mod tests {
                 panel.active_terminal_id().is_some(),
                 "the single initial terminal should become active"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_explicit_codex_terminal_coalesces_with_pending_initial_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.set_active(true, window, cx);
+            panel.new_codex_terminal(None, AgentThreadSource::Sidebar, window, cx);
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        panel.read_with(&cx, |panel, cx| {
+            let terminals = panel.terminals(cx);
+            assert_eq!(
+                terminals.len(),
+                1,
+                "an explicit Codex request should reuse the pending initial terminal"
+            );
+            assert_eq!(terminals[0].title.as_ref(), "Codex");
         });
     }
 
