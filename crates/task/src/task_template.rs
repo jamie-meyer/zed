@@ -95,6 +95,16 @@ pub enum DebugArgsRequest {
 pub enum TaskHook {
     #[serde(alias = "create_git_worktree")]
     CreateWorktree,
+    RemoveWorktree,
+}
+
+impl TaskHook {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::CreateWorktree => "create_worktree",
+            Self::RemoveWorktree => "remove_worktree",
+        }
+    }
 }
 
 /// What to do with the terminal pane and tab, after the command was started.

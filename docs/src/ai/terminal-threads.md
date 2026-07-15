@@ -5,17 +5,17 @@ description: Run agent CLIs and TUIs directly in terminal-backed threads in Zed.
 
 # Terminal Threads
 
-Terminal Threads are terminal-backed threads in the [Threads Sidebar](./parallel-agents.md#threads-sidebar). Use them when you want to run an agent CLI or TUI directly in Zed.
+Terminal Threads are terminal-backed sessions in the [Worktree Sidebar](./parallel-agents.md#threads-sidebar). Zed starts native CLI Codex in this surface by default.
 
 Terminal Threads are different from [External Agents](./external-agents.md). External Agents integrate with Zed through ACP and render as agent threads. Terminal Threads run the native command-line tool in a terminal that Zed organizes as a thread.
 
 ## What Zed Owns {#what-zed-owns}
 
-Zed owns the thread surface:
+Zed owns the session surface:
 
-- the terminal-backed thread in the Threads Sidebar
-- thread grouping by project
-- switching and organizing the terminal session alongside other threads
+- the terminal-backed session in the Worktree Sidebar
+- grouping sessions by Git worktree
+- switching, monitoring, and organizing terminal sessions
 
 ## What the CLI Owns {#what-the-cli-owns}
 
@@ -30,15 +30,17 @@ The CLI or TUI running inside the terminal owns its own:
 
 Zed Agent profiles, Zed Agent tool permissions, Zed Skills, and Zed Agent MCP settings do not automatically apply to Terminal Threads.
 
-## Opening a Terminal Thread {#opening-a-terminal-thread}
+## Opening Codex {#opening-a-terminal-thread}
 
-Open the new-thread menu from the [Agent Panel](./agent-panel.md) using the agent selector button on the left or the `+` icon in the top-right of the panel toolbar, then choose **Terminal**. The Terminal Thread opens in the panel body, just like switching to an agent thread.
+Click `+` in the Codex panel or beside a worktree in the Worktree Sidebar. Zed creates a real terminal in that worktree and starts the native `codex` CLI. Codex uses its own terminal UI, configuration, authentication, and instruction files; it does not use ACP or Zed's built-in agent harness.
 
-You can open as many Terminal Threads as you like. Each gets its own entry in the Threads Sidebar.
+Open the `+` menu and choose **Terminal** when you need a regular shell instead. Creating a new worktree also opens it and starts Codex automatically.
+
+You can open as many sessions as you like. Each gets its own entry beneath its worktree.
 
 ## Running a Command Automatically {#terminal-thread-init-command}
 
-If you always run the same CLI in Terminal Threads, set the `agent.terminal_init_command` setting to have Zed run a command automatically whenever Zed creates a Terminal Thread shell:
+The `agent.terminal_init_command` setting applies to regular Terminal sessions. Codex sessions always start `codex` directly. To run another command automatically in regular Terminal sessions, set:
 
 ```json [settings]
 {
@@ -144,14 +146,16 @@ Restart Pi after adding the extension, or run `/reload` if the extension is in o
 
 ### Codex Terminal Titles {#codex-terminal-titles}
 
-Codex can update the terminal title as it works, which Zed uses to show useful context for Codex Terminal Threads in the sidebar, such as the project, current status, branch, model, or task progress.
+Codex updates the terminal title as it works. Zed maps that title to the same sidebar states used by integrated agent threads: a spinner while Codex is working, a warning when Codex needs approval or user input, and an idle terminal icon when the turn is complete. Worktree and project headers show the aggregate state when their sessions are collapsed.
 
 To configure this from within Codex, run `/title` and use the picker to choose which fields appear and in what order. Codex saves the selection to `tui.terminal_title` in `~/.codex/config.toml`. You can also edit it directly:
 
 ```toml
 [tui]
-terminal_title = ["spinner", "project-name", "run-state", "thread-title"]
+terminal_title = ["activity", "project-name", "run-state", "thread-title"]
 ```
+
+Keep `activity` in the title selection if you want Zed to distinguish active work from approval prompts. Codex's default title selection already includes it.
 
 ## Credentials and Remote Projects {#credentials-and-remote-projects}
 

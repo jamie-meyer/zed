@@ -124,6 +124,10 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     fn is_threads_list_view_active(&self) -> bool {
         true
     }
+    fn is_worktree_view_active(&self) -> bool {
+        false
+    }
+    fn show_worktree_view(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
     /// Makes focus reset back to the search editor upon toggling the sidebar from outside
     fn prepare_for_focus(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
     /// Opens or cycles the thread switcher popup.
@@ -170,6 +174,8 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn cycle_thread(&self, forward: bool, window: &mut Window, cx: &mut App);
 
     fn is_threads_list_view_active(&self, cx: &App) -> bool;
+    fn is_worktree_view_active(&self, cx: &App) -> bool;
+    fn show_worktree_view(&self, window: &mut Window, cx: &mut App);
 
     fn side(&self, cx: &App) -> SidebarSide;
     fn serialized_state(&self, cx: &App) -> Option<String>;
@@ -248,6 +254,19 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
 
     fn is_threads_list_view_active(&self, cx: &App) -> bool {
         self.read(cx).is_threads_list_view_active()
+    }
+
+    fn is_worktree_view_active(&self, cx: &App) -> bool {
+        self.read(cx).is_worktree_view_active()
+    }
+
+    fn show_worktree_view(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.show_worktree_view(window, cx);
+            });
+        });
     }
 
     fn side(&self, cx: &App) -> SidebarSide {
@@ -426,6 +445,30 @@ impl MultiWorkspace {
                 sidebar.prepare_for_focus(window, cx);
                 sidebar.focus(window, cx);
             }
+        }
+    }
+
+    pub fn worktree_sidebar_open(&self, cx: &App) -> bool {
+        self.sidebar_open()
+            && self
+                .sidebar
+                .as_ref()
+                .is_some_and(|sidebar| sidebar.is_worktree_view_active(cx))
+    }
+
+    pub fn toggle_worktree_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.multi_workspace_enabled(cx) {
+            return;
+        }
+
+        if self.worktree_sidebar_open(cx) {
+            self.close_sidebar(window, cx);
+            return;
+        }
+
+        self.open_sidebar(cx);
+        if let Some(sidebar) = &self.sidebar {
+            sidebar.show_worktree_view(window, cx);
         }
     }
 

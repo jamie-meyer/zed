@@ -821,6 +821,7 @@ fn ensure_agent_panel_for_workspace(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
+    let start_codex_terminal = source_workspace.is_some();
     let task = setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
         agent_ui::AgentPanel::load(workspace, cx)
     });
@@ -834,6 +835,19 @@ fn ensure_agent_panel_for_workspace(
                 panel.update(cx, |panel, cx| {
                     panel.initialize_from_source_workspace_if_needed(source_workspace, window, cx);
                 });
+            }
+
+            if start_codex_terminal && let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx)
+            {
+                panel.update(cx, |panel, cx| {
+                    panel.ensure_codex_terminal(
+                        Some(workspace),
+                        agent_ui::AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    );
+                });
+                workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
             }
         })
     })

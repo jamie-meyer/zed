@@ -203,9 +203,22 @@ By default, Zed creates worktrees under `../worktrees` relative to the repositor
 
 See [All Settings](./reference/all-settings.md#git-worktree-directory) for examples.
 
-### Init Setup
+### Worktree Setup Files {#worktree-setup-files}
 
-To run setup steps after Zed creates a linked worktree, use the [`create_worktree` task hook](./tasks.md#hooks).
+Add a `.worktreeinclude` file to a local Git worktree to copy untracked setup files into each new linked worktree before Zed opens and indexes it. The file uses gitignore-style patterns and negation:
+
+```gitignore
+.env.local
+.codex/**
+config/local/**
+!config/local/example.json
+```
+
+Paths are copied from the worktree where creation started. Zed preserves symlinks, skips `.git`, and never overwrites a file already present in the new checkout. `.worktreeinclude` is only applied to local worktrees.
+
+### Setup and Teardown
+
+To run terminal commands after Zed creates a linked worktree or before Zed removes one, use the [`create_worktree` and `remove_worktree` task hooks](./tasks.md#hooks).
 For agent-specific workflows, see [Worktree Isolation](./ai/parallel-agents.md#worktree-isolation).
 
 ### Multi-root Workspaces

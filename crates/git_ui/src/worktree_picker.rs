@@ -24,7 +24,10 @@ use workspace::{
 };
 
 use crate::git_panel::show_error_toast;
-use crate::worktree_service::{RemoteBranchName, WorktreeCreateTarget, worktree_create_targets};
+use crate::worktree_service::{
+    RemoteBranchName, RemoveWorktreeTaskContext, WorktreeCreateTarget, run_remove_worktree_tasks,
+    worktree_create_targets,
+};
 use zed_actions::{
     CreateWorktree, NewWorktreeBranchTarget, OpenWorktreeInNewWindow, SwitchWorktree,
 };
@@ -502,6 +505,19 @@ impl WorktreePickerDelegate {
                 .map(|worktree| worktree.path.as_path()),
         );
         let workspace = self.workspace.clone();
+        let teardown_context = {
+            let project = self.project.read(cx);
+            let repository = repo.read(cx);
+            project
+                .find_worktree(&repository.work_directory_abs_path, cx)
+                .map(|(worktree, _)| {
+                    RemoveWorktreeTaskContext::new(
+                        workspace.clone(),
+                        worktree.read(cx).id(),
+                        repository.main_worktree_abs_path().map(Path::to_path_buf),
+                    )
+                })
+        };
 
         self.deleting_worktree_paths.insert(path.clone());
         if self.hovered_delete_index == Some(ix) {
@@ -510,6 +526,28 @@ impl WorktreePickerDelegate {
         cx.notify();
 
         cx.spawn_in(window, async move |picker, cx| {
+            if let Some(teardown_context) = teardown_context
+                && let Err(error) =
+                    run_remove_worktree_tasks(teardown_context, path.clone(), cx).await
+            {
+                if let Some(workspace) = workspace.upgrade() {
+                    picker.update_in(cx, |picker, _window, cx| {
+                        if picker.delegate.deleting_worktree_paths.remove(&path) {
+                            cx.notify();
+                        }
+                    })?;
+                    cx.update(|_window, cx| {
+                        show_error_toast(
+                            workspace,
+                            format!("worktree teardown {}", path.display()),
+                            error,
+                            cx,
+                        )
+                    })?;
+                }
+                return Ok(());
+            }
+
             let initial_result = match repo
                 .update(cx, |repo, _| repo.remove_worktree(path.clone(), force))
                 .await

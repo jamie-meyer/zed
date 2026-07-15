@@ -7374,6 +7374,7 @@ dependencies = [
  "fuzzy_nucleo",
  "git",
  "gpui",
+ "ignore",
  "indoc",
  "itertools 0.14.0",
  "language",

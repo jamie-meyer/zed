@@ -51,6 +51,7 @@ pub struct ThreadItem {
     selected: bool,
     focused: bool,
     hovered: bool,
+    compact: bool,
     rounded: bool,
     is_truncated: bool,
     added: Option<usize>,
@@ -86,6 +87,7 @@ impl ThreadItem {
             selected: false,
             focused: false,
             hovered: false,
+            compact: false,
             rounded: false,
             is_truncated: true,
             added: None,
@@ -214,6 +216,11 @@ impl ThreadItem {
         self
     }
 
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
+        self
+    }
+
     pub fn rounded(mut self, rounded: bool) -> Self {
         self.rounded = rounded;
         self
@@ -256,6 +263,21 @@ impl RenderOnce for ThreadItem {
         // fade into, so it renders as a visible patch; truncate the title instead.
         let opaque_window =
             cx.theme().window_background_appearance() == WindowBackgroundAppearance::Opaque;
+        let title_label_size = if self.compact {
+            LabelSize::Small
+        } else {
+            LabelSize::Default
+        };
+        let metadata_label_size = if self.compact {
+            LabelSize::XSmall
+        } else {
+            LabelSize::Small
+        };
+        let icon_size = if self.compact {
+            IconSize::XSmall
+        } else {
+            IconSize::Small
+        };
         let sidebar_base_bg = color
             .title_bar_background
             .blend(color.panel_background.opacity(0.25));
@@ -283,7 +305,7 @@ impl RenderOnce for ThreadItem {
         let separator_color = Color::Custom(color.text_muted.opacity(0.4));
         let dot_separator = || {
             Label::new("•")
-                .size(LabelSize::Small)
+                .size(metadata_label_size)
                 .color(separator_color)
         };
 
@@ -306,19 +328,19 @@ impl RenderOnce for ThreadItem {
         } else if let Some(custom_svg) = self.custom_icon_from_external_svg {
             Icon::from_external_svg(custom_svg)
                 .color(icon_color)
-                .size(IconSize::Small)
+                .size(icon_size)
                 .into_any_element()
         } else {
             Icon::new(self.icon)
                 .color(icon_color)
-                .size(IconSize::Small)
+                .size(icon_size)
                 .into_any_element()
         };
 
         let status_icon = if self.status == AgentThreadStatus::Error {
             Some(
                 Icon::new(IconName::Close)
-                    .size(IconSize::Small)
+                    .size(icon_size)
                     .color(Color::Error),
             )
         } else if self.status == AgentThreadStatus::WaitingForConfirmation {
@@ -341,7 +363,7 @@ impl RenderOnce for ThreadItem {
             icon_container()
                 .child(
                     Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Small)
+                        .size(icon_size)
                         .color(Color::Muted)
                         .with_rotate_animation(2),
                 )
@@ -353,12 +375,21 @@ impl RenderOnce for ThreadItem {
         };
 
         let title = self.title;
-        let highlight_positions = self.highlight_positions;
+        let highlight_positions = if self
+            .highlight_positions
+            .iter()
+            .all(|index| *index < title.len() && title.is_char_boundary(*index))
+        {
+            self.highlight_positions
+        } else {
+            Vec::new()
+        };
 
         let title_label = if let Some(title_slot) = self.title_slot {
             title_slot
         } else if self.title_generating {
             Label::new(title)
+                .size(title_label_size)
                 .color(Color::Muted)
                 .with_animation(
                     "generating-title",
@@ -370,11 +401,13 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         } else if highlight_positions.is_empty() {
             Label::new(title)
+                .size(title_label_size)
                 .when_some(self.title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
+                .size(title_label_size)
                 .when_some(self.title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
@@ -432,7 +465,7 @@ impl RenderOnce for ThreadItem {
             .flex_shrink_0()
             .overflow_hidden()
             .w_full()
-            .py_1()
+            .py(if self.compact { px(2.0) } else { px(4.0) })
             .px_1p5()
             .when(self.selected, |s| s.bg(color.element_active))
             .border_1()
@@ -500,7 +533,9 @@ impl RenderOnce for ThreadItem {
                             |this| {
                                 this.when_some(self.project_name, |this, name| {
                                     this.child(
-                                        Label::new(name).size(LabelSize::Small).color(Color::Muted),
+                                        Label::new(name)
+                                            .size(metadata_label_size)
+                                            .color(Color::Muted),
                                     )
                                 })
                                 .when(
@@ -510,7 +545,7 @@ impl RenderOnce for ThreadItem {
                                 .when_some(project_paths, |this, paths| {
                                     this.child(
                                         Label::new(paths)
-                                            .size(LabelSize::Small)
+                                            .size(metadata_label_size)
                                             .color(Color::Muted),
                                     )
                                 })
@@ -522,7 +557,7 @@ impl RenderOnce for ThreadItem {
                                         let worktree_label = wt.worktree_name.clone().map(|name| {
                                             if wt.highlight_positions.is_empty() {
                                                 Label::new(name)
-                                                    .size(LabelSize::Small)
+                                                    .size(metadata_label_size)
                                                     .color(Color::Muted)
                                                     .truncate()
                                                     .into_any_element()
@@ -531,7 +566,7 @@ impl RenderOnce for ThreadItem {
                                                     name,
                                                     wt.highlight_positions.clone(),
                                                 )
-                                                .size(LabelSize::Small)
+                                                .size(metadata_label_size)
                                                 .color(Color::Muted)
                                                 .truncate()
                                                 .into_any_element()
@@ -551,7 +586,7 @@ impl RenderOnce for ThreadItem {
 
                                         let branch_label = wt.branch_name.map(|branch| {
                                             Label::new(branch)
-                                                .size(LabelSize::Small)
+                                                .size(metadata_label_size)
                                                 .color(Color::Muted)
                                                 .truncate()
                                                 .into_any_element()
@@ -574,7 +609,7 @@ impl RenderOnce for ThreadItem {
                                             .when(show_separator, |this| {
                                                 this.child(
                                                     Label::new("/")
-                                                        .size(LabelSize::Small)
+                                                        .size(metadata_label_size)
                                                         .color(separator_color)
                                                         .flex_shrink_0(),
                                                 )
@@ -600,7 +635,7 @@ impl RenderOnce for ThreadItem {
                         .when(has_timestamp, |this| {
                             this.child(
                                 Label::new(timestamp.clone())
-                                    .size(LabelSize::Small)
+                                    .size(metadata_label_size)
                                     .color(Color::Muted),
                             )
                         }),

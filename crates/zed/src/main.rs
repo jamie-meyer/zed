@@ -202,6 +202,11 @@ static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
 
+    #[cfg(target_os = "macos")]
+    if let Err(error) = util::raise_file_descriptor_limit() {
+        eprintln!("failed to raise the open file limit: {error}");
+    }
+
     // If this process was re-executed as a sandbox launcher (Linux
     // bwrap/seccomp), install the seccomp policy and exec the wrapped command
     // without returning. Must run before argument parsing: the wrapped

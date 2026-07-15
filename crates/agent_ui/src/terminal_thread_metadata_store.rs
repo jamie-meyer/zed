@@ -13,7 +13,7 @@ use db::{
 use futures::{FutureExt, future::Shared};
 use gpui::{AppContext as _, Entity, Global, Task};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
-use ui::{App, Context, SharedString};
+use ui::{AgentThreadStatus, App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::PathList;
 
@@ -21,6 +21,7 @@ use crate::{TerminalId, thread_metadata_store::WorktreePaths};
 
 pub fn init(cx: &mut App) {
     TerminalThreadMetadataStore::init_global(cx);
+    TerminalThreadStatusStore::init_global(cx);
 }
 
 struct GlobalTerminalThreadMetadataStore(Entity<TerminalThreadMetadataStore>);
@@ -93,6 +94,22 @@ pub(crate) fn terminal_title_without_prefix(title: &str) -> &str {
         .unwrap_or(title)
 }
 
+pub(crate) fn terminal_title_for_persistence(title: &str) -> SharedString {
+    const ACTION_REQUIRED_PREFIXES: [&str; 2] = ["[ ! ] Action Required", "[ . ] Action Required"];
+
+    if ACTION_REQUIRED_PREFIXES
+        .iter()
+        .any(|prefix| title.starts_with(prefix))
+    {
+        return title
+            .split_once(" | ")
+            .map(|(_, title)| SharedString::from(title.to_string()))
+            .unwrap_or_default();
+    }
+
+    SharedString::from(terminal_title_without_prefix(title).to_string())
+}
+
 pub fn terminal_title_prefix(title: &str) -> Option<&str> {
     let mut prefix_byte_len = 0;
     let mut saw_prefix_character = false;
@@ -132,6 +149,56 @@ pub fn terminal_title_prefix(title: &str) -> Option<&str> {
         Some(&title[..prefix_byte_len])
     } else {
         None
+    }
+}
+
+pub struct TerminalThreadStatusStore {
+    statuses: HashMap<TerminalId, AgentThreadStatus>,
+}
+
+struct GlobalTerminalThreadStatusStore(Entity<TerminalThreadStatusStore>);
+
+impl Global for GlobalTerminalThreadStatusStore {}
+
+impl TerminalThreadStatusStore {
+    pub fn init_global(cx: &mut App) {
+        if cx.has_global::<GlobalTerminalThreadStatusStore>() {
+            return;
+        }
+
+        let store = cx.new(|_| Self {
+            statuses: HashMap::default(),
+        });
+        cx.set_global(GlobalTerminalThreadStatusStore(store));
+    }
+
+    pub fn global(cx: &mut App) -> Entity<Self> {
+        Self::init_global(cx);
+        cx.global::<GlobalTerminalThreadStatusStore>().0.clone()
+    }
+
+    pub fn status(&self, terminal_id: TerminalId) -> AgentThreadStatus {
+        self.statuses.get(&terminal_id).copied().unwrap_or_default()
+    }
+
+    pub fn set_status(
+        &mut self,
+        terminal_id: TerminalId,
+        status: AgentThreadStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if self.statuses.get(&terminal_id) == Some(&status) {
+            return;
+        }
+
+        self.statuses.insert(terminal_id, status);
+        cx.notify();
+    }
+
+    pub fn remove(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        if self.statuses.remove(&terminal_id).is_some() {
+            cx.notify();
+        }
     }
 }
 
@@ -644,6 +711,20 @@ mod tests {
         assert_eq!(terminal_title_prefix(" Thinking"), None);
         assert_eq!(terminal_title_prefix("✳"), None);
         assert_eq!(terminal_title_prefix("v1 Running"), None);
+    }
+
+    #[test]
+    fn test_terminal_title_for_persistence_removes_live_activity() {
+        assert_eq!(terminal_title_for_persistence("⠋ zed").as_ref(), "zed");
+        assert_eq!(
+            terminal_title_for_persistence("[ ! ] Action Required | zed").as_ref(),
+            "zed"
+        );
+        assert_eq!(
+            terminal_title_for_persistence("[ . ] Action Required | zed").as_ref(),
+            "zed"
+        );
+        assert_eq!(terminal_title_for_persistence("zed").as_ref(), "zed");
     }
 
     #[test]

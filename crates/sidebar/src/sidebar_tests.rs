@@ -187,6 +187,7 @@ fn assert_remote_project_integration_sidebar_state(
                     terminal.metadata.title
                 );
             }
+            ListEntry::WorktreeHeader(_) => {}
         }
     }
 
@@ -224,6 +225,11 @@ fn setup_sidebar(
     sidebar
 }
 
+#[test]
+fn test_sidebar_defaults_to_worktree_grouping() {
+    assert_eq!(ThreadGroupingMode::default(), ThreadGroupingMode::Worktree);
+}
+
 fn setup_sidebar_closed(
     multi_workspace: &Entity<MultiWorkspace>,
     cx: &mut gpui::VisualTestContext,
@@ -231,6 +237,9 @@ fn setup_sidebar_closed(
     let multi_workspace = multi_workspace.clone();
     let sidebar =
         cx.update(|window, cx| cx.new(|cx| Sidebar::new(multi_workspace.clone(), window, cx)));
+    sidebar.update(cx, |sidebar, _cx| {
+        sidebar.thread_grouping = ThreadGroupingMode::Project;
+    });
     multi_workspace.update(cx, |mw, cx| {
         mw.register_sidebar(sidebar.clone(), cx);
     });
@@ -574,6 +583,12 @@ fn visible_entries_as_strings(
                         };
                         format!("{} [{}]{}", icon, label, selected)
                     }
+                    ListEntry::WorktreeHeader(WorktreeListEntry::Worktree(worktree)) => {
+                        format!("  [worktree:{}]{}", worktree.display_name, selected)
+                    }
+                    ListEntry::WorktreeHeader(WorktreeListEntry::Stale(worktree)) => {
+                        format!("  [worktree:{}]{}", worktree.display_name, selected)
+                    }
                     ListEntry::Thread(thread) => {
                         let title = thread.metadata.display_title();
                         let worktree = format_linked_worktree_chips(&thread.worktrees);
@@ -809,6 +824,8 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
     let serialized = serde_json::to_string(&SerializedSidebar {
         width: Some(400.0),
         active_view: SerializedSidebarView::History,
+        thread_grouping: ThreadGroupingMode::Project,
+        show_open_worktrees_only: false,
     })
     .expect("serialization should succeed");
 
@@ -819,12 +836,13 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
     });
     cx.run_until_parked();
 
-    // After the deferred `show_archive` runs, the view should be Archive.
+    // Legacy state must not restore the retired ACP history surface.
     sidebar.read_with(cx, |sidebar, _cx| {
         assert!(
-            matches!(sidebar.view, SidebarView::Archive(_)),
-            "expected sidebar view to be Archive after restore, got ThreadList"
+            matches!(sidebar.view, SidebarView::ThreadList),
+            "expected sidebar view to remain the terminal list"
         );
+        assert_eq!(sidebar.thread_grouping, ThreadGroupingMode::Worktree);
     });
 }
 
@@ -2006,6 +2024,100 @@ async fn test_agent_panel_terminal_shows_project_and_linked_worktree(cx: &mut Te
         visible_entries_as_strings(&sidebar, cx),
         vec!["v [project]", "  Dev Server {wt-feature-a}  <== selected"]
     );
+}
+
+#[gpui::test]
+async fn test_worktree_grouping_keeps_terminal_under_linked_worktree(cx: &mut TestAppContext) {
+    agent_ui::test_support::init_test(cx);
+    cx.update(|cx| {
+        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        ThreadStore::init_global(cx);
+        ThreadMetadataStore::init_global(cx);
+        language_model::LanguageModelRegistry::test(cx);
+        prompt_store::init(cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project", serde_json::json!({ ".git": {}, "src": {} }))
+        .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/wt-feature-a"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project = project::Project::test(fs, ["/wt-feature-a".as_ref()], cx).await;
+    main_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let worktree_workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(worktree_project, window, cx)
+    });
+    let panel = add_agent_panel(&worktree_workspace, cx);
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Codex", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_worktree_sidebar(window, cx);
+    });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.worktree_sidebar_open(cx));
+    });
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(sidebar.is_worktree_view_active());
+        let worktree_header_index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    ListEntry::WorktreeHeader(WorktreeListEntry::Worktree(worktree))
+                        if worktree.path() == Path::new("/wt-feature-a")
+                )
+            })
+            .expect("linked worktree header should be visible");
+        assert!(matches!(
+            sidebar.contents.entries.get(worktree_header_index + 1),
+            Some(ListEntry::Terminal(terminal))
+                if terminal.metadata.terminal_id == terminal_id
+                    && terminal.worktrees.is_empty()
+        ));
+    });
+
+    type_in_search(&sidebar, "Codex", cx);
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(sidebar.contents.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                ListEntry::Terminal(terminal)
+                    if terminal.metadata.terminal_id == terminal_id
+            )
+        }));
+    });
 }
 
 #[gpui::test]
@@ -4964,7 +5076,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -5050,7 +5164,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -5089,7 +5205,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -7139,6 +7257,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         terminal.metadata.title
                     );
                 }
+                ListEntry::WorktreeHeader(_) => {}
             }
         }
 
@@ -9022,9 +9141,9 @@ async fn test_linked_worktree_threads_not_duplicated_across_groups(cx: &mut Test
         visible_entries_as_strings(&sidebar, cx),
         vec![
             //
-            "v [other, project]",
             "v [project]",
             "  Worktree Thread {wt-feature-a}",
+            "v [other, project]",
         ]
     );
 }

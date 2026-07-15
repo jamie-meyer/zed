@@ -296,6 +296,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Starts Codex in a new terminal thread.
+        NewCodexTerminal,
     ]
 );
 
@@ -998,6 +1000,10 @@ mod tests {
                 "NewTerminalThread should be visible by default"
             );
             assert!(
+                !filter.is_hidden(&NewCodexTerminal),
+                "NewCodexTerminal should be visible by default"
+            );
+            assert!(
                 !filter.is_hidden(&zed_actions::assistant::OpenSkillCreator),
                 "OpenSkillCreator should be visible by default"
             );
@@ -1035,6 +1041,10 @@ mod tests {
             assert!(
                 filter.is_hidden(&NewTerminalThread),
                 "NewTerminalThread should be hidden when agent is disabled"
+            );
+            assert!(
+                filter.is_hidden(&NewCodexTerminal),
+                "NewCodexTerminal should be hidden when agent is disabled"
             );
             assert!(
                 filter.is_hidden(&zed_actions::assistant::OpenGlobalAgentsMdRules),

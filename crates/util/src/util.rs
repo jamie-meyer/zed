@@ -229,6 +229,35 @@ Error: Running Zed as root or via sudo is unsupported.
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn raise_file_descriptor_limit() -> std::io::Result<()> {
+    const DESIRED_LIMIT: libc::rlim_t = 10_240;
+
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let desired_limit = if limits.rlim_max == libc::RLIM_INFINITY {
+        DESIRED_LIMIT
+    } else {
+        DESIRED_LIMIT.min(limits.rlim_max)
+    };
+    if limits.rlim_cur >= desired_limit {
+        return Ok(());
+    }
+
+    limits.rlim_cur = desired_limit;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 #[cfg(unix)]
 fn load_shell_from_passwd() -> Result<()> {
     let buflen = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
@@ -791,6 +820,22 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_raise_file_descriptor_limit() {
+        raise_file_descriptor_limit().expect("file descriptor limit should be raised");
+
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0
+        );
+        assert!(limits.rlim_cur >= 10_240);
+    }
 
     #[test]
     fn test_extend_sorted() {

@@ -155,6 +155,7 @@ pub async fn record_zed_created_worktree(
 pub struct TestWorkspaceSidebar {
     focus_handle: FocusHandle,
     threads_list_active: bool,
+    worktree_view_active: bool,
 }
 
 impl TestWorkspaceSidebar {
@@ -162,6 +163,7 @@ impl TestWorkspaceSidebar {
         Self {
             focus_handle: cx.focus_handle(),
             threads_list_active,
+            worktree_view_active: false,
         }
     }
 }
@@ -191,6 +193,15 @@ impl WorkspaceSidebar for TestWorkspaceSidebar {
 
     fn is_threads_list_view_active(&self) -> bool {
         self.threads_list_active
+    }
+
+    fn is_worktree_view_active(&self) -> bool {
+        self.threads_list_active && self.worktree_view_active
+    }
+
+    fn show_worktree_view(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.threads_list_active = true;
+        self.worktree_view_active = true;
     }
 }
 

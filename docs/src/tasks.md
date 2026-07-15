@@ -236,17 +236,28 @@ In addition to being spawned manually, tasks can be configured to run automatica
 
 The following hooks are currently supported:
 
-- `create_worktree` — runs after Zed creates a new linked Git worktree, either directly through the CLI or from the [worktree picker](./git.md#git-worktrees). The task is spawned with `ZED_WORKTREE_ROOT` pointing at the newly created worktree and `ZED_MAIN_GIT_WORKTREE` pointing at the original repository's working directory, which makes these hooks well-suited to copying untracked files (such as `.env` files) or running per-worktree setup commands.
+- `create_worktree` — runs after Zed creates a new linked Git worktree and copies its [worktree setup files](./git.md#worktree-setup-files). The task is spawned with `ZED_WORKTREE_ROOT` pointing at the newly created worktree and `ZED_MAIN_GIT_WORKTREE` pointing at the original repository's working directory.
+- `remove_worktree` — runs before Zed removes a linked Git worktree from the worktree picker. It uses the same variables, but `ZED_WORKTREE_ROOT` and the task working directory point at the worktree being removed so the task can clean up resources that belong to it.
+
+Zed waits for worktree hook tasks to finish. Tasks for the same worktree run in declaration order, while hooks for separate roots in a multi-root workspace may run concurrently. A failed `create_worktree` hook leaves the new worktree open and reports the setup failure. A failed `remove_worktree` hook reports the failure and prevents Zed from deleting the worktree.
 
 Hook tasks are resolved from the same global and worktree-local `tasks.json` files as manually spawned tasks, and multiple tasks may register for the same hook; they all run when the hook fires. A hook task still benefits from the usual task configuration fields — `cwd`, `env`, `reveal`, `hide`, and so on — so you can control how much of the terminal UI is shown while it runs.
 
 ```json [tasks]
 [
   {
-    "label": "copy .env into new worktree",
-    "command": "cp",
-    "args": ["$ZED_MAIN_GIT_WORKTREE/.env", "$ZED_WORKTREE_ROOT/.env"],
+    "label": "install worktree dependencies",
+    "command": "npm",
+    "args": ["install"],
     "hooks": ["create_worktree"],
+    "reveal": "no_focus",
+    "hide": "on_success"
+  },
+  {
+    "label": "stop worktree services",
+    "command": "docker",
+    "args": ["compose", "down"],
+    "hooks": ["remove_worktree"],
     "reveal": "no_focus",
     "hide": "on_success"
   }

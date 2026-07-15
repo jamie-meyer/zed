@@ -1,5 +1,46 @@
 # Zed
 
+## Worktree Setup and Teardown
+
+New worktrees can copy local, untracked files from the main checkout. Add a
+`.worktreeinclude` file at the repository root using gitignore-style patterns:
+
+```gitignore
+.env.local
+.zed/settings.json
+config/local/**
+```
+
+Matching files, directories, and symlinks are copied after Git creates the
+worktree. Existing files in the new checkout are never overwritten. Patterns
+that leave the repository root are rejected.
+
+Setup and teardown commands are regular Zed tasks in `.zed/tasks.json`. Mark
+them with the `create_worktree` or `remove_worktree` hook:
+
+```json
+[
+  {
+    "label": "Set up worktree",
+    "command": "./script/setup-worktree",
+    "hooks": ["create_worktree"]
+  },
+  {
+    "label": "Tear down worktree",
+    "command": "./script/teardown-worktree",
+    "hooks": ["remove_worktree"]
+  }
+]
+```
+
+Hook commands run in terminals with the target worktree as their working
+directory. `ZED_WORKTREE_ROOT` points to that worktree and
+`ZED_MAIN_GIT_WORKTREE` points to the main checkout when available. Commands
+must be available in the terminal environment and exit successfully. A failed
+setup leaves the new worktree open and reports the error; a failed teardown
+stops removal before Zed closes the workspace or deletes its checkout. Both the
+worktree picker and the Worktree Sidebar use this teardown path.
+
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
