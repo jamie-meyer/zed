@@ -462,6 +462,7 @@ dependencies = [
  "ai_onboarding",
  "anyhow",
  "async-channel 2.5.0",
+ "async-process",
  "audio",
  "base64 0.22.1",
  "buffer_diff",
@@ -549,6 +550,7 @@ dependencies = [
  "uuid",
  "vim",
  "watch",
+ "which 6.0.3",
  "workspace",
  "zed_actions",
 ]

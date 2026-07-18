@@ -36,6 +36,7 @@ agent_settings.workspace = true
 agent_skills.workspace = true
 ai_onboarding.workspace = true
 anyhow.workspace = true
+async-process.workspace = true
 heapless.workspace = true
 audio = { workspace = true, optional = true }
 base64.workspace = true
@@ -111,6 +112,7 @@ url.workspace = true
 util.workspace = true
 uuid.workspace = true
 watch.workspace = true
+which.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 image.workspace = true

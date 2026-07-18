@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+#[cfg(not(any(test, feature = "test-support")))]
+use std::time::Duration;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -11,7 +13,7 @@ use db::{
     sqlez_macros::sql,
 };
 use futures::{FutureExt, future::Shared};
-use gpui::{AppContext as _, Entity, Global, Task};
+use gpui::{AppContext as _, Entity, EventEmitter, Global, Task};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::{AgentThreadStatus, App, Context, SharedString};
 use util::ResultExt as _;
@@ -54,6 +56,7 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
+    pub initial_command: Option<String>,
 }
 
 impl TerminalThreadMetadata {
@@ -154,11 +157,26 @@ pub fn terminal_title_prefix(title: &str) -> Option<&str> {
 
 pub struct TerminalThreadStatusStore {
     statuses: HashMap<TerminalId, AgentThreadStatus>,
+    running_status_frames: HashMap<TerminalId, u8>,
+    running_status_animation_active: bool,
+    _running_status_animation_task: Option<Task<()>>,
+}
+
+const RUNNING_STATUS_FRAME_COUNT: u8 = 8;
+#[cfg(not(any(test, feature = "test-support")))]
+const RUNNING_STATUS_FRAME_INTERVAL: Duration = Duration::from_millis(125);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalThreadStatusChanged {
+    pub terminal_id: TerminalId,
+    pub previous_status: Option<AgentThreadStatus>,
+    pub status: AgentThreadStatus,
 }
 
 struct GlobalTerminalThreadStatusStore(Entity<TerminalThreadStatusStore>);
 
 impl Global for GlobalTerminalThreadStatusStore {}
+impl EventEmitter<TerminalThreadStatusChanged> for TerminalThreadStatusStore {}
 
 impl TerminalThreadStatusStore {
     pub fn init_global(cx: &mut App) {
@@ -168,6 +186,9 @@ impl TerminalThreadStatusStore {
 
         let store = cx.new(|_| Self {
             statuses: HashMap::default(),
+            running_status_frames: HashMap::default(),
+            running_status_animation_active: false,
+            _running_status_animation_task: None,
         });
         cx.set_global(GlobalTerminalThreadStatusStore(store));
     }
@@ -181,24 +202,107 @@ impl TerminalThreadStatusStore {
         self.statuses.get(&terminal_id).copied().unwrap_or_default()
     }
 
+    pub fn running_status_phase(&self, terminal_id: TerminalId) -> f32 {
+        let frame = self
+            .running_status_frames
+            .get(&terminal_id)
+            .copied()
+            .unwrap_or_default();
+        f32::from(frame) / f32::from(RUNNING_STATUS_FRAME_COUNT)
+    }
+
+    pub fn any_running_status_phase(&self) -> Option<f32> {
+        self.running_status_frames
+            .values()
+            .next()
+            .map(|frame| f32::from(*frame) / f32::from(RUNNING_STATUS_FRAME_COUNT))
+    }
+
     pub fn set_status(
         &mut self,
         terminal_id: TerminalId,
         status: AgentThreadStatus,
         cx: &mut Context<Self>,
     ) {
-        if self.statuses.get(&terminal_id) == Some(&status) {
+        let previous_status = self.statuses.get(&terminal_id).copied();
+        if previous_status == Some(status) {
             return;
         }
 
         self.statuses.insert(terminal_id, status);
+        if status == AgentThreadStatus::Running {
+            self.running_status_frames.insert(terminal_id, 0);
+            self.start_running_status_animation(cx);
+        } else {
+            self.running_status_frames.remove(&terminal_id);
+        }
+        cx.emit(TerminalThreadStatusChanged {
+            terminal_id,
+            previous_status,
+            status,
+        });
         cx.notify();
     }
 
     pub fn remove(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
-        if self.statuses.remove(&terminal_id).is_some() {
+        let removed_status = self.statuses.remove(&terminal_id).is_some();
+        let removed_frame = self.running_status_frames.remove(&terminal_id).is_some();
+        if removed_status || removed_frame {
             cx.notify();
         }
+    }
+
+    fn start_running_status_animation(&mut self, cx: &mut Context<Self>) {
+        if self.running_status_animation_active {
+            return;
+        }
+
+        self.running_status_animation_active = true;
+
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let _ = cx;
+        }
+
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            self._running_status_animation_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(RUNNING_STATUS_FRAME_INTERVAL)
+                        .await;
+                    let Ok(should_continue) = this.update(cx, |this, cx| {
+                        let should_continue = this.advance_running_status_frames(cx);
+                        if !should_continue {
+                            this.running_status_animation_active = false;
+                        }
+                        should_continue
+                    }) else {
+                        break;
+                    };
+                    if !should_continue {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    fn advance_running_status_frames(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.running_status_frames.is_empty() {
+            return false;
+        }
+
+        for frame in self.running_status_frames.values_mut() {
+            *frame = (*frame + 1) % RUNNING_STATUS_FRAME_COUNT;
+        }
+        cx.notify();
+        true
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn advance_running_status_frames_for_test(&mut self, cx: &mut Context<Self>) {
+        self.advance_running_status_frames(cx);
     }
 }
 
@@ -512,20 +616,26 @@ struct TerminalThreadMetadataDb(ThreadSafeConnection);
 impl Domain for TerminalThreadMetadataDb {
     const NAME: &str = stringify!(TerminalThreadMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
-            terminal_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            custom_title TEXT,
-            created_at TEXT NOT NULL,
-            working_directory TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT,
-            main_worktree_paths TEXT,
-            main_worktree_paths_order TEXT,
-            remote_connection TEXT
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT
+            ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads
+            ADD COLUMN initial_command TEXT;
+        ),
+    ];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
@@ -535,7 +645,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection \
+            main_worktree_paths_order, remote_connection, initial_command \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -569,10 +679,11 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal thread remote connection")?;
+        let initial_command = row.initial_command;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, initial_command) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -582,7 +693,8 @@ impl TerminalThreadMetadataDb {
                            folder_paths_order = excluded.folder_paths_order, \
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection";
+                           remote_connection = excluded.remote_connection, \
+                           initial_command = excluded.initial_command";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -593,7 +705,8 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&folder_paths_order, i)?;
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
-            stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&remote_connection, i)?;
+            stmt.bind(&initial_command, i)?;
             stmt.exec()
         })
         .await
@@ -629,6 +742,7 @@ impl Column for TerminalThreadMetadata {
             Column::column(statement, next)?;
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
+        let (initial_command, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -668,6 +782,7 @@ impl Column for TerminalThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
+                initial_command,
             },
             next,
         ))
@@ -697,6 +812,7 @@ mod tests {
             worktree_paths,
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
         }
     }
 
@@ -738,6 +854,37 @@ mod tests {
 
         metadata.title = "Thinking".into();
         assert_eq!(metadata.display_title().as_ref(), "Fix bug");
+    }
+
+    #[gpui::test]
+    async fn test_initial_command_round_trips_through_database(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut metadata = metadata(
+            "Codex",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        metadata.initial_command = Some("codex --profile work".to_string());
+        let terminal_id = metadata.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(metadata, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let rows = TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .db
+                .list()
+                .expect("terminal metadata should load");
+            let row = rows
+                .into_iter()
+                .find(|row| row.terminal_id == terminal_id)
+                .expect("saved terminal metadata should exist");
+            assert_eq!(row.initial_command.as_deref(), Some("codex --profile work"));
+        });
     }
 
     #[gpui::test]

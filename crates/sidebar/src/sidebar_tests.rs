@@ -4,7 +4,8 @@ use agent::ThreadStore;
 use agent_ui::{
     ThreadId,
     terminal_thread_metadata_store::{
-        TerminalThreadMetadata, TerminalThreadMetadataStore, TestTerminalMetadataDbName,
+        TerminalThreadMetadata, TerminalThreadMetadataStore, TerminalThreadStatusStore,
+        TestTerminalMetadataDbName,
     },
     test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -499,6 +500,29 @@ fn focus_sidebar(sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext) {
         cx.focus_self(window);
     });
     cx.run_until_parked();
+}
+
+fn close_terminal_from_sidebar(
+    sidebar: &Entity<Sidebar>,
+    terminal_id: TerminalId,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let (metadata, workspace) = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id => {
+                    Some((terminal.metadata.clone(), terminal.workspace.clone()))
+                }
+                _ => None,
+            })
+            .expect("terminal should be visible in sidebar")
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.close_terminal(&metadata, &workspace, window, cx);
+    });
 }
 
 fn request_test_tool_authorization(
@@ -1772,6 +1796,92 @@ async fn test_agent_panel_terminals_appear_in_sidebar_and_search(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn test_terminal_status_store_updates_sidebar_entry(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Codex", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        TerminalThreadStatusStore::global(cx).update(cx, |store, cx| {
+            store.set_status(terminal_id, AgentThreadStatus::Running, cx);
+        });
+    });
+    cx.run_until_parked();
+    let first_running_phase = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id => {
+                    Some(terminal.running_status_phase)
+                }
+                _ => None,
+            })
+            .expect("terminal should remain visible in sidebar")
+    });
+
+    cx.update(|_, cx| {
+        TerminalThreadStatusStore::global(cx).update(cx, |store, cx| {
+            store.advance_running_status_frames_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _cx| {
+        let terminal = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id => {
+                    Some(terminal)
+                }
+                _ => None,
+            })
+            .expect("terminal should remain visible in sidebar");
+        assert_eq!(terminal.status, AgentThreadStatus::Running);
+        assert_ne!(terminal.running_status_phase, first_running_phase);
+    });
+
+    for status in [
+        AgentThreadStatus::WaitingForConfirmation,
+        AgentThreadStatus::Completed,
+    ] {
+        cx.update(|_, cx| {
+            TerminalThreadStatusStore::global(cx).update(cx, |store, cx| {
+                store.set_status(terminal_id, status, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        sidebar.read_with(cx, |sidebar, _cx| {
+            let terminal_status = sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::Terminal(terminal)
+                        if terminal.metadata.terminal_id == terminal_id =>
+                    {
+                        Some(terminal.status)
+                    }
+                    _ => None,
+                })
+                .expect("terminal should remain visible in sidebar");
+            assert_eq!(terminal_status, status);
+        });
+    }
+}
+
+#[gpui::test]
 async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -1932,6 +2042,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        initial_command: None,
     };
 
     cx.update(|_, cx| {
@@ -2121,7 +2232,70 @@ async fn test_worktree_grouping_keeps_terminal_under_linked_worktree(cx: &mut Te
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace(
+async fn test_restored_unloaded_project_does_not_show_missing_worktree(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/open-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Codex", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    cx.run_until_parked();
+
+    let closed_paths = PathList::new(&[PathBuf::from("/closed-project")]);
+    cx.update(|_, cx| {
+        let store = TerminalThreadMetadataStore::global(cx);
+        let mut metadata = store
+            .read(cx)
+            .entry(terminal_id)
+            .cloned()
+            .expect("terminal metadata should exist");
+        metadata.worktree_paths = WorktreePaths::from_folder_paths(&closed_paths);
+        store.update(cx, |store, cx| store.save(metadata, cx));
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_project_groups(
+            vec![workspace::SerializedProjectGroupState {
+                key: ProjectGroupKey::new(None, closed_paths),
+                expanded: true,
+            }],
+            cx,
+        );
+        cx.notify();
+    });
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_worktree_sidebar(window, cx);
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let visible_entries = visible_entries_as_strings(&sidebar, cx);
+    sidebar.read_with(cx, |sidebar, _cx| {
+        let restored_worktree = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::WorktreeHeader(WorktreeListEntry::Stale(worktree))
+                    if worktree.path == Path::new("/closed-project") =>
+                {
+                    Some(worktree)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("restored worktree header should be visible; entries: {visible_entries:?}")
+            });
+        assert_eq!(restored_worktree.display_name.as_ref(), "closed-project");
+        assert!(!restored_worktree.is_missing);
+    });
+}
+
+#[gpui::test]
+async fn test_explicit_terminal_close_on_archived_linked_worktree_removes_workspace(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -2263,9 +2437,7 @@ async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace
         "expected linked worktree terminal before closing, got: {entries_before:?}"
     );
 
-    worktree_panel.update(cx, |panel, cx| {
-        panel.emit_test_terminal_close(terminal_id, cx);
-    });
+    close_terminal_from_sidebar(&sidebar, terminal_id, cx);
     for _ in 0..4 {
         cx.run_until_parked();
     }
@@ -2320,7 +2492,7 @@ async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_deletes_empty_draft_when_linked_worktree_has_no_archive_root(
+async fn test_explicit_terminal_close_deletes_empty_draft_when_linked_worktree_has_no_archive_root(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -2363,7 +2535,7 @@ async fn test_terminal_close_event_deletes_empty_draft_when_linked_worktree_has_
 
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
-    let _sidebar = setup_sidebar(&multi_workspace, cx);
+    let sidebar = setup_sidebar(&multi_workspace, cx);
     let worktree_workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
         multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
     });
@@ -2395,9 +2567,7 @@ async fn test_terminal_close_event_deletes_empty_draft_when_linked_worktree_has_
         .expect("test terminal should be inserted");
     cx.run_until_parked();
 
-    worktree_panel.update(cx, |panel, cx| {
-        panel.emit_test_terminal_close(terminal_id, cx);
-    });
+    close_terminal_from_sidebar(&sidebar, terminal_id, cx);
     for _ in 0..4 {
         cx.run_until_parked();
     }
@@ -2427,7 +2597,7 @@ async fn test_terminal_close_event_deletes_empty_draft_when_linked_worktree_has_
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_keeps_linked_worktree_workspace_with_live_editor_draft(
+async fn test_explicit_terminal_close_keeps_linked_worktree_workspace_with_live_editor_draft(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -2487,7 +2657,7 @@ async fn test_terminal_close_event_keeps_linked_worktree_workspace_with_live_edi
 
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
-    let _sidebar = setup_sidebar(&multi_workspace, cx);
+    let sidebar = setup_sidebar(&multi_workspace, cx);
     let worktree_workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
         multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
     });
@@ -2571,9 +2741,7 @@ async fn test_terminal_close_event_keeps_linked_worktree_workspace_with_live_edi
         "should start with main and linked worktree workspaces"
     );
 
-    worktree_panel.update(cx, |panel, cx| {
-        panel.emit_test_terminal_close(terminal_id, cx);
-    });
+    close_terminal_from_sidebar(&sidebar, terminal_id, cx);
     for _ in 0..4 {
         cx.run_until_parked();
     }
@@ -3000,7 +3168,7 @@ async fn test_archive_selected_draft_archives_closed_linked_worktree(cx: &mut Te
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_closes_sidebar_terminal(cx: &mut TestAppContext) {
+async fn test_terminal_client_close_keeps_persistent_sidebar_terminal(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -3027,8 +3195,8 @@ async fn test_terminal_close_event_closes_sidebar_terminal(cx: &mut TestAppConte
         assert!(!panel.has_terminal(terminal_id));
     });
     sidebar.read_with(cx, |sidebar, _cx| {
-        assert!(sidebar.contents.entries.iter().all(|entry| {
-            !matches!(entry, ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id)
+        assert!(sidebar.contents.entries.iter().any(|entry| {
+            matches!(entry, ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id)
         }));
     });
     sidebar.read_with(cx, |_sidebar, cx| {
@@ -3036,8 +3204,8 @@ async fn test_terminal_close_event_closes_sidebar_terminal(cx: &mut TestAppConte
             TerminalThreadMetadataStore::global(cx)
                 .read(cx)
                 .entry(terminal_id)
-                .is_none(),
-            "terminal metadata should be deleted when the terminal requests close"
+                .is_some(),
+            "detaching the Zed terminal client must retain persistent tmux metadata"
         );
     });
 }
@@ -3217,6 +3385,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        initial_command: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3324,6 +3493,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        initial_command: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3472,6 +3642,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        initial_command: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {

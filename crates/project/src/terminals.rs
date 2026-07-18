@@ -292,7 +292,32 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, false, cx)
+        self.create_terminal_shell_internal(cwd, false, None, true, cx)
+    }
+
+    pub fn create_terminal_shell_with_program(
+        &mut self,
+        cwd: Option<PathBuf>,
+        program: String,
+        args: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        if self.remote_client.is_some() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "custom terminal programs are not supported in remote projects"
+            )));
+        }
+        self.create_terminal_shell_internal(
+            cwd,
+            false,
+            Some(Shell::WithArguments {
+                program,
+                args,
+                title_override: None,
+            }),
+            false,
+            cx,
+        )
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -309,7 +334,7 @@ impl Project {
             // Local project: use project directory like normal terminals
             self.active_project_directory(cx).map(|p| p.to_path_buf())
         };
-        self.create_terminal_shell_internal(working_directory, true, cx)
+        self.create_terminal_shell_internal(working_directory, true, None, true, cx)
     }
 
     /// Internal method for creating terminal shells.
@@ -319,6 +344,8 @@ impl Project {
         &mut self,
         cwd: Option<PathBuf>,
         force_local: bool,
+        shell_override: Option<Shell>,
+        run_activation_script: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -359,15 +386,19 @@ impl Project {
         } else {
             self.remote_client.clone()
         };
-        let shell = match &remote_client {
+        let configured_shell = match &remote_client {
             Some(remote_client) => remote_client
                 .read(cx)
                 .shell()
                 .unwrap_or_else(get_default_system_shell),
             None => settings.shell.program(),
         };
+        let shell = shell_override
+            .as_ref()
+            .map(Shell::program)
+            .unwrap_or_else(|| configured_shell.clone());
         let env_shell = match &remote_client {
-            Some(_) => shell.clone(),
+            Some(_) => configured_shell,
             None => get_system_shell(),
         };
 
@@ -409,7 +440,7 @@ impl Project {
                             Some(remote_client) => {
                                 create_remote_shell(None, env, path, remote_client, cx)?
                             }
-                            None => (settings.shell, env),
+                            None => (shell_override.unwrap_or(settings.shell), env),
                         }
                     };
                     anyhow::Ok(TerminalBuilder::new(
@@ -426,7 +457,11 @@ impl Project {
                         cx.entity_id().as_u64(),
                         None,
                         cx,
-                        activation_script,
+                        if run_activation_script {
+                            activation_script
+                        } else {
+                            Vec::new()
+                        },
                         path_style,
                     ))
                 })??

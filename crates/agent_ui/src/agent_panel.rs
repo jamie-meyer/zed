@@ -41,10 +41,12 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    TerminalThreadMetadata, TerminalThreadMetadataStore, TerminalThreadStatusStore,
-    compose_terminal_thread_title, terminal_title_for_persistence, terminal_title_without_prefix,
+    TerminalThreadMetadata, TerminalThreadMetadataStore, TerminalThreadStatusChanged,
+    TerminalThreadStatusStore, compose_terminal_thread_title, terminal_title_for_persistence,
+    terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::tmux_session;
 use crate::{
     AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
     LoadThreadFromClipboard, NewCodexTerminal, NewTerminalThread, NewThread,
@@ -134,16 +136,25 @@ const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "qwen",
 ];
 
+#[cfg(test)]
 fn is_known_terminal_agent_command(command: &str) -> bool {
-    KNOWN_TERMINAL_AGENT_COMMANDS.contains(&command)
+    canonical_terminal_agent_command(command).is_some()
+}
+
+fn canonical_terminal_agent_command(command: &str) -> Option<&'static str> {
+    KNOWN_TERMINAL_AGENT_COMMANDS
+        .iter()
+        .copied()
+        .find(|known| command == *known)
+        .or_else(|| command.starts_with("codex-").then_some("codex"))
 }
 
 fn terminal_program_to_report(
     last_observed_program: &mut Option<String>,
     current_program: Option<String>,
 ) -> Option<String> {
-    let current_program =
-        current_program.filter(|program| is_known_terminal_agent_command(program));
+    let current_program = current_program
+        .and_then(|program| canonical_terminal_agent_command(&program).map(ToString::to_string));
     let program_to_report =
         if current_program.is_some() && current_program != *last_observed_program {
             current_program.clone()
@@ -1005,6 +1016,7 @@ struct AgentTerminal {
     last_known_terminal_title: String,
     last_observed_program: Option<String>,
     working_directory: Option<PathBuf>,
+    initial_command: Option<String>,
     created_at: DateTime<Utc>,
     has_notification: bool,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
@@ -1141,23 +1153,24 @@ fn terminal_agent_status(terminal: &AgentTerminal, cx: &App) -> Option<AgentThre
     )
 }
 
-fn terminal_status_from_process_and_title(
+pub(crate) fn terminal_status_from_process_and_title(
     foreground_program: Option<&str>,
     terminal_title: &str,
 ) -> Option<AgentThreadStatus> {
-    let foreground_program = foreground_program?;
-    if !is_known_terminal_agent_command(foreground_program) {
-        return None;
-    }
+    let foreground_program = canonical_terminal_agent_command(foreground_program?)?;
 
     if foreground_program != "codex" {
         return Some(AgentThreadStatus::Running);
     }
 
+    Some(codex_status_from_title(terminal_title))
+}
+
+pub(crate) fn codex_status_from_title(terminal_title: &str) -> AgentThreadStatus {
     if terminal_title.starts_with("[ ! ] Action Required")
         || terminal_title.starts_with("[ . ] Action Required")
     {
-        return Some(AgentThreadStatus::WaitingForConfirmation);
+        return AgentThreadStatus::WaitingForConfirmation;
     }
 
     const CODEX_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -1170,9 +1183,9 @@ fn terminal_status_from_process_and_title(
             .any(|part| matches!(part, "Starting" | "Working" | "Waiting" | "Thinking"))
         || terminal_title.is_empty()
     {
-        Some(AgentThreadStatus::Running)
+        AgentThreadStatus::Running
     } else {
-        Some(AgentThreadStatus::Completed)
+        AgentThreadStatus::Completed
     }
 }
 
@@ -1263,6 +1276,7 @@ pub struct AgentPanel {
     _draft_editor_observation: Option<Subscription>,
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
+    _terminal_status_store_subscription: Subscription,
     last_context_source: Option<AgentContextSource>,
     replace_restored_thread_with_codex_on_activation: bool,
 
@@ -1549,7 +1563,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1615,6 +1629,23 @@ impl AgentPanel {
                 }
             },
         );
+        let terminal_status_store = TerminalThreadStatusStore::global(cx);
+        let _terminal_status_store_subscription = cx.subscribe_in(
+            &terminal_status_store,
+            window,
+            |_this, _store, event: &TerminalThreadStatusChanged, window, cx| {
+                let was_active = matches!(
+                    event.previous_status,
+                    Some(AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation)
+                );
+                if was_active && event.status == AgentThreadStatus::Completed {
+                    let terminal_id = event.terminal_id;
+                    cx.defer_in(window, move |this, window, cx| {
+                        this.mark_terminal_notification(terminal_id, window, cx);
+                    });
+                }
+            },
+        );
 
         cx.on_release(|this, cx| {
             this.dismiss_all_terminal_notifications(cx);
@@ -1657,6 +1688,7 @@ impl AgentPanel {
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
+            _terminal_status_store_subscription,
             last_context_source: None,
             replace_restored_thread_with_codex_on_activation: false,
             is_active: false,
@@ -2098,20 +2130,72 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command =
+        let initial_command =
             init_command_override.or_else(|| Self::terminal_init_command(run_init_command, cx));
-        let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
-        });
+        #[cfg(any(test, feature = "test-support"))]
+        let ensure_session_task: Task<Result<bool>> = Task::ready(Ok(true));
+
+        #[cfg(not(any(test, feature = "test-support")))]
+        let ensure_session_task = if self.project.read(cx).is_local() {
+            cx.background_spawn({
+                let working_directory = working_directory.clone();
+                async move {
+                    tmux_session::ensure_session(terminal_id, working_directory.as_deref()).await
+                }
+            })
+        } else {
+            Task::ready(Err(anyhow!(
+                "Persistent Terminal Threads require tmux on the project host; remote projects are not supported yet"
+            )))
+        };
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
-        let project = self.project.downgrade();
+        let project = self.project.clone();
 
         cx.spawn_in(window, async move |this, cx| {
+            let session_created = match ensure_session_task.await {
+                Ok(session_created) => session_created,
+                Err(error) => {
+                    log::error!("failed to create tmux terminal session: {error:#}");
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                        .log_err();
+                    this.update(cx, |this, cx| {
+                        if this.pending_terminal_spawn == Some(terminal_id) {
+                            this.pending_terminal_spawn = None;
+                            cx.notify();
+                        }
+                    })
+                    .log_err();
+                    return anyhow::Ok(());
+                }
+            };
+
+            #[cfg(any(test, feature = "test-support"))]
+            let terminal_task = project.update(cx, |project, cx| {
+                project.create_terminal_shell(working_directory, cx)
+            });
+
+            #[cfg(not(any(test, feature = "test-support")))]
+            let attach_shell = tmux_session::attach_shell(terminal_id);
+            #[cfg(not(any(test, feature = "test-support")))]
+            let (program, args) = attach_shell.program_and_args();
+            #[cfg(not(any(test, feature = "test-support")))]
+            let terminal_task = project.update(cx, |project, cx| {
+                project.create_terminal_shell_with_program(
+                    working_directory,
+                    program,
+                    args.to_vec(),
+                    cx,
+                )
+            });
             let terminal = match terminal_task.await {
                 Ok(terminal) => terminal,
                 Err(error) => {
                     log::error!("failed to spawn agent panel terminal: {error:#}");
+                    if session_created {
+                        tmux_session::kill_session(terminal_id).await.log_err();
+                    }
                     workspace
                         .update(cx, |workspace, cx| workspace.show_error(error, cx))
                         .log_err();
@@ -2128,7 +2212,14 @@ impl AgentPanel {
             this.update_in(cx, |this, window, cx| {
                 let terminal_for_init_command = terminal.clone();
                 let terminal_view = cx.new(|cx| {
-                    TerminalView::new(terminal, workspace, workspace_id, project, window, cx)
+                    TerminalView::new(
+                        terminal,
+                        workspace,
+                        workspace_id,
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
                 });
                 this.insert_terminal(
                     terminal_id,
@@ -2139,11 +2230,18 @@ impl AgentPanel {
                     created_at,
                     select,
                     focus,
+                    initial_command.clone(),
                     source,
                     window,
                     cx,
                 );
-                Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
+                if session_created {
+                    Self::write_terminal_init_command(
+                        &terminal_for_init_command,
+                        initial_command,
+                        cx,
+                    );
+                }
             })?;
             anyhow::Ok(())
         })
@@ -2185,6 +2283,7 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
+        initial_command: Option<String>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2245,6 +2344,7 @@ impl AgentPanel {
             last_known_terminal_title,
             last_observed_program: None,
             working_directory,
+            initial_command,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
             notification_windows: Vec::new(),
@@ -2296,7 +2396,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_terminal_internal(terminal_id, true, None, window, cx);
+        self.kill_and_close_terminal(terminal_id, true, window, cx);
     }
 
     pub fn close_terminal_without_activating_draft(
@@ -2305,14 +2405,59 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_terminal_internal(terminal_id, false, None, window, cx);
+        self.kill_and_close_terminal(terminal_id, false, window, cx);
+    }
+
+    pub fn close_terminal_after_tmux_killed(
+        &mut self,
+        terminal_id: TerminalId,
+        activate_draft_after_close: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_terminal_internal(terminal_id, activate_draft_after_close, window, cx);
+    }
+
+    fn kill_and_close_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        activate_draft_after_close: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.close_terminal_internal(terminal_id, activate_draft_after_close, window, cx);
+        }
+
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let workspace = self.workspace.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                if let Err(error) = tmux_session::kill_session(terminal_id).await {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                        .log_err();
+                    return anyhow::Ok(());
+                }
+                this.update_in(cx, |this, window, cx| {
+                    this.close_terminal_internal(
+                        terminal_id,
+                        activate_draft_after_close,
+                        window,
+                        cx,
+                    );
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
     }
 
     fn close_terminal_internal(
         &mut self,
         terminal_id: TerminalId,
         activate_draft_after_close: bool,
-        terminal_closed_metadata: Option<TerminalThreadMetadata>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2322,9 +2467,7 @@ impl AgentPanel {
             self.pending_terminal_spawn = None;
         }
         self.dismiss_terminal_notifications(terminal_id, cx);
-        if self.terminals.remove(&terminal_id).is_none() {
-            return;
-        }
+        self.terminals.remove(&terminal_id);
         TerminalThreadStatusStore::global(cx).update(cx, |store, cx| {
             store.remove(terminal_id, cx);
         });
@@ -2341,9 +2484,6 @@ impl AgentPanel {
             }
         }
 
-        if let Some(metadata) = terminal_closed_metadata {
-            cx.emit(AgentPanelEvent::TerminalClosed { metadata });
-        }
         cx.emit(AgentPanelEvent::EntryChanged);
         cx.notify();
     }
@@ -2354,8 +2494,18 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let metadata = self.terminal_metadata(terminal_id, cx);
-        self.close_terminal_internal(terminal_id, false, metadata, window, cx);
+        let was_active = self.active_terminal_id() == Some(terminal_id);
+        self.persist_terminal_metadata(terminal_id, cx);
+        self.dismiss_terminal_notifications(terminal_id, cx);
+        if self.terminals.remove(&terminal_id).is_none() {
+            return;
+        }
+        if was_active {
+            self.base_view = BaseView::Uninitialized;
+            self.refresh_base_view_subscriptions(window, cx);
+        }
+        cx.emit(AgentPanelEvent::EntryChanged);
+        cx.notify();
     }
 
     fn emit_terminal_thread_started(
@@ -2444,11 +2594,13 @@ impl AgentPanel {
     }
 
     fn refresh_terminal_status(&self, terminal_id: TerminalId, cx: &mut App) {
-        let status = self
+        let Some(status) = self
             .terminals
             .get(&terminal_id)
             .and_then(|terminal| terminal_agent_status(terminal, cx))
-            .unwrap_or_default();
+        else {
+            return;
+        };
         TerminalThreadStatusStore::global(cx).update(cx, |store, cx| {
             store.set_status(terminal_id, status, cx);
         });
@@ -2488,6 +2640,7 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            initial_command: terminal.initial_command.clone(),
         })
     }
 
@@ -2512,6 +2665,13 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(metadata.terminal_id);
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
+        let initial_command = metadata.initial_command.clone().or_else(|| {
+            metadata
+                .custom_title
+                .as_ref()
+                .is_some_and(|title| title.as_ref() == "Codex")
+                .then(|| "codex".to_string())
+        });
         self.spawn_terminal(
             metadata.terminal_id,
             working_directory,
@@ -2520,8 +2680,8 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
-            None,
+            false,
+            initial_command,
             source,
             window,
             cx,
@@ -2854,9 +3014,7 @@ impl AgentPanel {
                 AgentPanelEvent::ActiveViewChanged | AgentPanelEvent::ActiveViewFocused => {
                     this.dismiss_terminal_pop_up_if_visible(terminal_id, &pop_up_weak, window, cx);
                 }
-                AgentPanelEvent::EntryChanged
-                | AgentPanelEvent::TerminalClosed { .. }
-                | AgentPanelEvent::ThreadInteracted { .. } => {}
+                AgentPanelEvent::EntryChanged | AgentPanelEvent::ThreadInteracted { .. } => {}
             }
         });
 
@@ -5162,7 +5320,6 @@ pub enum AgentPanelEvent {
     ActiveViewChanged,
     ActiveViewFocused,
     EntryChanged,
-    TerminalClosed { metadata: TerminalThreadMetadata },
     ThreadInteracted { thread_id: ThreadId },
 }
 
@@ -6859,6 +7016,7 @@ impl AgentPanel {
             created_at,
             select,
             focus,
+            init_command.clone(),
             source,
             window,
             cx,
@@ -6925,6 +7083,7 @@ mod tests {
     fn test_is_known_terminal_agent_command() {
         assert!(is_known_terminal_agent_command("claude"));
         assert!(is_known_terminal_agent_command("codex"));
+        assert!(is_known_terminal_agent_command("codex-aarch64-a"));
         assert!(!is_known_terminal_agent_command("cargo"));
         assert!(!is_known_terminal_agent_command("internal-agent"));
     }
@@ -6939,6 +7098,13 @@ mod tests {
         );
         assert_eq!(
             terminal_program_to_report(&mut last_observed_program, Some("codex".to_string())),
+            None
+        );
+        assert_eq!(
+            terminal_program_to_report(
+                &mut last_observed_program,
+                Some("codex-aarch64-a".to_string())
+            ),
             None
         );
         assert_eq!(
@@ -6987,6 +7153,13 @@ mod tests {
         assert_eq!(
             terminal_status_from_process_and_title(Some("codex"), "zed"),
             Some(AgentThreadStatus::Completed)
+        );
+        assert_eq!(
+            terminal_status_from_process_and_title(
+                Some("codex-aarch64-a"),
+                "[ ! ] Action Required | zed"
+            ),
+            Some(AgentThreadStatus::WaitingForConfirmation)
         );
         assert_eq!(
             terminal_status_from_process_and_title(Some("cargo"), "⠋ zed"),
@@ -7424,6 +7597,7 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7536,6 +7710,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -7696,6 +7871,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9542,7 +9718,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_terminal_close_event_closes_without_sidebar(cx: &mut TestAppContext) {
+    async fn test_terminal_client_close_retains_metadata_without_sidebar(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
             TerminalThreadMetadataStore::init_global(cx);
@@ -9568,8 +9744,8 @@ mod tests {
                 TerminalThreadMetadataStore::global(cx)
                     .read(cx)
                     .entry(terminal_id)
-                    .is_none(),
-                "terminal metadata should be deleted by the fallback close"
+                    .is_some(),
+                "detaching the terminal client must retain persistent tmux metadata"
             );
         });
     }
@@ -9817,6 +9993,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -9868,6 +10045,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            initial_command: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10292,6 +10470,39 @@ mod tests {
                 .find(|terminal| terminal.id == first_terminal_id)
                 .expect("first terminal should remain in the panel");
             assert!(!first_terminal.has_notification);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_completion_status_marks_notification(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let first_terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Build", true, window, cx)
+            })
+            .expect("first test terminal should be inserted");
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Server", true, window, cx)
+            })
+            .expect("second test terminal should be inserted");
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            TerminalThreadStatusStore::global(cx).update(cx, |store, cx| {
+                store.set_status(first_terminal_id, AgentThreadStatus::Running, cx);
+                store.set_status(first_terminal_id, AgentThreadStatus::Completed, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let first_terminal = panel
+                .terminals(cx)
+                .into_iter()
+                .find(|terminal| terminal.id == first_terminal_id)
+                .expect("first terminal should remain in the panel");
+            assert!(first_terminal.has_notification);
         });
     }
 

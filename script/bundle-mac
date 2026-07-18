@@ -90,10 +90,6 @@ rustup target add $target_triple
 
 echo "Compiling zed binaries"
 cargo build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo build ${build_flag} --package remote_server --target $target_triple
-
 echo "Creating application bundle"
 pushd crates/zed
 cp Cargo.toml Cargo.toml.backup
@@ -248,13 +244,7 @@ function sign_app_binaries() {
         open "$app_path"
     fi
 
-    if [[ "$target_dir" = "debug" ]]; then
-        echo "Debug build detected - skipping DMG creation and signing"
-        if [ "$local_install" = false ]; then
-            echo "Created application bundle:"
-            echo "$app_path"
-        fi
-    else
+    if [ "$local_install" = false ]; then
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
         dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
@@ -298,27 +288,12 @@ function sign_app_binaries() {
     fi
 }
 
-function sign_binary() {
-    local binary_path=$1
-
-    if [[ $can_code_sign = true ]]; then
-        echo "Code signing executable $binary_path"
-        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${binary_path}" -v
-    fi
-}
-
 function upload_debug_symbols() {
     if [ "$local_install" = true ]; then
         echo "local install; skipping sentry upload."
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
-        exe_path="target/${target_triple}/release/Zed"
         if ! dsymutil --flat "target/${target_triple}/${target_dir}/zed" 2> target/dsymutil.log; then
-            echo "dsymutil failed"
-            cat target/dsymutil.log
-            exit 1
-        fi
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
             echo "dsymutil failed"
             cat target/dsymutil.log
             exit 1
@@ -329,8 +304,7 @@ function upload_debug_symbols() {
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/zed.dwarf" \
-                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
+                "target/${target_triple}/${target_dir}/zed.dwarf"; then
                 break
             else
                 echo "Sentry upload failed on attempt $attempt"
@@ -350,6 +324,3 @@ upload_debug_symbols
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
-
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz

@@ -32,6 +32,7 @@ pub mod test_support;
 mod thread_import;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
+mod tmux_session;
 
 pub mod threads_archive_view;
 mod ui;
@@ -90,6 +91,10 @@ pub use thread_import::{
 };
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
+
+pub async fn kill_terminal_session(terminal_id: TerminalId) -> anyhow::Result<()> {
+    tmux_session::kill_session(terminal_id).await
+}
 
 pub(crate) fn resolve_agent_image(
     dest_url: &str,
@@ -589,6 +594,7 @@ pub fn init(
     context_server_configuration::init(language_registry.clone(), fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    tmux_session::TmuxSessionManager::init_global(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

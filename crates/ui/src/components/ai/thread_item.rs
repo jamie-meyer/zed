@@ -32,6 +32,49 @@ pub struct ThreadItemWorktreeInfo {
     pub kind: WorktreeKind,
 }
 
+pub fn dotted_activity_indicator(phase: f32, cx: &App) -> AnyElement {
+    const DOT_POSITIONS: [Option<usize>; 9] = [
+        Some(0),
+        Some(1),
+        Some(2),
+        Some(7),
+        None,
+        Some(3),
+        Some(6),
+        Some(5),
+        Some(4),
+    ];
+
+    let active_dot = ((phase * 8.).round() as usize) % 8;
+    div()
+        .grid()
+        .grid_cols(3)
+        .grid_rows(3)
+        .size(px(12.))
+        .children(DOT_POSITIONS.into_iter().map(|dot_position| {
+            div().flex().items_center().justify_center().when_some(
+                dot_position,
+                |cell, dot_position| {
+                    let trail_distance = (active_dot + 8 - dot_position) % 8;
+                    let opacity = match trail_distance {
+                        0 => 1.,
+                        1 => 0.65,
+                        2 => 0.35,
+                        _ => 0.15,
+                    };
+                    cell.child(
+                        div()
+                            .size(px(2.))
+                            .rounded_full()
+                            .bg(cx.theme().colors().text_muted)
+                            .opacity(opacity),
+                    )
+                },
+            )
+        }))
+        .into_any_element()
+}
+
 #[derive(IntoElement, RegisterComponent)]
 pub struct ThreadItem {
     id: ElementId,
@@ -48,6 +91,8 @@ pub struct ThreadItem {
     timestamp: SharedString,
     notified: bool,
     status: AgentThreadStatus,
+    running_status_phase: Option<f32>,
+    show_completed_status: bool,
     selected: bool,
     focused: bool,
     hovered: bool,
@@ -84,6 +129,8 @@ impl ThreadItem {
             timestamp: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
+            running_status_phase: None,
+            show_completed_status: false,
             selected: false,
             focused: false,
             hovered: false,
@@ -143,6 +190,16 @@ impl ThreadItem {
 
     pub fn status(mut self, status: AgentThreadStatus) -> Self {
         self.status = status;
+        self
+    }
+
+    pub fn running_status_phase(mut self, phase: f32) -> Self {
+        self.running_status_phase = Some(phase);
+        self
+    }
+
+    pub fn show_completed_status(mut self, show: bool) -> Self {
+        self.show_completed_status = show;
         self
     }
 
@@ -355,19 +412,27 @@ impl RenderOnce for ThreadItem {
                     .size(IconSize::Small)
                     .color(Color::Accent),
             )
+        } else if self.status == AgentThreadStatus::Completed && self.show_completed_status {
+            Some(
+                Icon::new(IconName::Check)
+                    .size(icon_size)
+                    .color(Color::Success),
+            )
         } else {
             None
         };
 
         let icon = if self.status == AgentThreadStatus::Running {
-            icon_container()
-                .child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(icon_size)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2),
-                )
-                .into_any_element()
+            let indicator = if let Some(phase) = self.running_status_phase {
+                dotted_activity_indicator(phase, cx)
+            } else {
+                Icon::new(IconName::LoadCircle)
+                    .size(icon_size)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            };
+            icon_container().child(indicator).into_any_element()
         } else if let Some(status_icon) = status_icon {
             icon_container().child(status_icon).into_any_element()
         } else {
