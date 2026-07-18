@@ -112,6 +112,8 @@ const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
+const TERMINAL_WAKEUP_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
+const TERMINAL_MONITOR_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -1007,6 +1009,7 @@ struct AgentTerminal {
     has_notification: bool,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
+    monitor_refresh_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -2186,6 +2189,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        terminal_view.update(cx, |terminal_view, _cx| {
+            terminal_view.set_wakeup_refresh_interval(Some(TERMINAL_WAKEUP_REFRESH_INTERVAL));
+        });
         if let Some(custom_title) = custom_title {
             terminal_view.update(cx, |terminal_view, cx| {
                 terminal_view.set_custom_title(Some(custom_title.to_string()), cx);
@@ -2195,8 +2201,11 @@ impl AgentPanel {
         let view_subscription = cx.subscribe(
             &terminal_view,
             move |this, _terminal_view, event: &ItemEvent, cx| match event {
-                ItemEvent::UpdateTab | ItemEvent::UpdateBreadcrumbs => {
+                ItemEvent::UpdateBreadcrumbs => {
                     this.refresh_terminal_metadata(terminal_id, cx);
+                }
+                ItemEvent::UpdateTab => {
+                    this.schedule_terminal_monitor_refresh(terminal_id, source, cx);
                 }
                 ItemEvent::CloseItem | ItemEvent::Edit => {}
             },
@@ -2207,12 +2216,11 @@ impl AgentPanel {
             &terminal_entity,
             window,
             move |this, _terminal, event: &TerminalEvent, window, cx| match event {
-                TerminalEvent::TitleChanged
-                | TerminalEvent::Wakeup
-                | TerminalEvent::BreadcrumbsChanged => {
-                    this.refresh_terminal_metadata(terminal_id, cx);
-                    this.report_terminal_program(terminal_id, source, cx);
-                    this.refresh_terminal_status(terminal_id, cx);
+                TerminalEvent::TitleChanged | TerminalEvent::BreadcrumbsChanged => {
+                    this.refresh_terminal_monitoring(terminal_id, source, cx);
+                }
+                TerminalEvent::Wakeup => {
+                    this.schedule_terminal_monitor_refresh(terminal_id, source, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
                 TerminalEvent::CloseTerminal => {
@@ -2241,6 +2249,7 @@ impl AgentPanel {
             has_notification: false,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
+            monitor_refresh_task: None,
             _subscriptions: vec![view_subscription, terminal_subscription],
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
@@ -2372,6 +2381,54 @@ impl AgentPanel {
             self.persist_terminal_metadata(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
+        }
+    }
+
+    fn refresh_terminal_monitoring(
+        &mut self,
+        terminal_id: TerminalId,
+        source: AgentThreadSource,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.monitor_refresh_task = None;
+        }
+        self.refresh_terminal_metadata(terminal_id, cx);
+        self.report_terminal_program(terminal_id, source, cx);
+        self.refresh_terminal_status(terminal_id, cx);
+    }
+
+    fn schedule_terminal_monitor_refresh(
+        &mut self,
+        terminal_id: TerminalId,
+        source: AgentThreadSource,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        if terminal.monitor_refresh_task.is_some() {
+            return;
+        }
+
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(TERMINAL_MONITOR_REFRESH_INTERVAL)
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(terminal) = this.terminals.get_mut(&terminal_id) else {
+                    return;
+                };
+                terminal.monitor_refresh_task = None;
+                this.refresh_terminal_metadata(terminal_id, cx);
+                this.report_terminal_program(terminal_id, source, cx);
+                this.refresh_terminal_status(terminal_id, cx);
+            })
+            .ok();
+        });
+
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.monitor_refresh_task = Some(task);
         }
     }
 
@@ -9513,6 +9570,74 @@ mod tests {
                     .entry(terminal_id)
                     .is_none(),
                 "terminal metadata should be deleted by the fallback close"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_wakeups_coalesce_monitoring_refresh(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Codex", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        let terminal_entity = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in the panel")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+
+        terminal_entity.update(&mut cx, |terminal, cx| {
+            terminal.breadcrumb_text = "Action Required".to_string();
+            for _ in 0..10 {
+                cx.emit(TerminalEvent::Wakeup);
+            }
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .expect("terminal should remain in the panel")
+                    .last_known_terminal_title,
+                ""
+            );
+        });
+
+        cx.executor()
+            .advance_clock(TERMINAL_MONITOR_REFRESH_INTERVAL - Duration::from_millis(1));
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .expect("terminal should remain in the panel")
+                    .last_known_terminal_title,
+                ""
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .expect("terminal should remain in the panel")
+                    .last_known_terminal_title,
+                "Action Required"
             );
         });
     }

@@ -29,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use task::TaskId;
 use terminal::{
@@ -152,6 +152,9 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    wakeup_refresh_interval: Option<Duration>,
+    last_wakeup_refresh: Option<Instant>,
+    pending_wakeup_refresh: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -298,9 +301,60 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            wakeup_refresh_interval: None,
+            last_wakeup_refresh: None,
+            pending_wakeup_refresh: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
+    }
+
+    pub fn set_wakeup_refresh_interval(&mut self, interval: Option<Duration>) {
+        self.wakeup_refresh_interval = interval;
+        self.last_wakeup_refresh = None;
+        self.pending_wakeup_refresh = None;
+    }
+
+    fn emit_wakeup_refresh(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        cx.emit(Event::Wakeup);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.emit(SearchEvent::MatchesInvalidated);
+    }
+
+    fn handle_wakeup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(interval) = self.wakeup_refresh_interval else {
+            self.emit_wakeup_refresh(cx);
+            return;
+        };
+
+        let now = cx.background_executor().now();
+        let remaining = self
+            .last_wakeup_refresh
+            .and_then(|last_refresh| {
+                interval.checked_sub(now.saturating_duration_since(last_refresh))
+            })
+            .filter(|remaining| !remaining.is_zero());
+
+        let Some(remaining) = remaining else {
+            self.last_wakeup_refresh = Some(now);
+            self.emit_wakeup_refresh(cx);
+            return;
+        };
+
+        if self.pending_wakeup_refresh.is_some() {
+            return;
+        }
+
+        self.pending_wakeup_refresh = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(remaining).await;
+            this.update_in(cx, |this, _window, cx| {
+                this.pending_wakeup_refresh = None;
+                this.last_wakeup_refresh = Some(cx.background_executor().now());
+                this.emit_wakeup_refresh(cx);
+            })
+            .ok();
+        }));
     }
 
     /// Enable 'embedded' mode where the terminal displays the full content with an optional limit of lines.
@@ -1097,10 +1151,7 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
-                    cx.notify();
-                    cx.emit(Event::Wakeup);
-                    cx.emit(ItemEvent::UpdateTab);
-                    cx.emit(SearchEvent::MatchesInvalidated);
+                    terminal_view.handle_wakeup(window, cx);
                 }
 
                 Event::Bell => {
@@ -2141,6 +2192,11 @@ mod tests {
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
 
+    struct TerminalViewEventCounter {
+        update_tab_count: usize,
+        _subscription: Subscription,
+    }
+
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();
         for path in paths {
@@ -2830,6 +2886,58 @@ mod tests {
     }
 
     // Terminal rename tests
+
+    #[gpui::test]
+    async fn test_wakeup_refreshes_are_coalesced(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, false, cx);
+
+        terminal_view.update(cx, |terminal_view, _cx| {
+            terminal_view.set_wakeup_refresh_interval(Some(Duration::from_millis(100)));
+        });
+        let event_counter = cx.new(|cx| {
+            let subscription = cx.subscribe(
+                &terminal_view,
+                |this: &mut TerminalViewEventCounter, _, event: &ItemEvent, _cx| {
+                    if matches!(event, ItemEvent::UpdateTab) {
+                        this.update_tab_count += 1;
+                    }
+                },
+            );
+            TerminalViewEventCounter {
+                update_tab_count: 0,
+                _subscription: subscription,
+            }
+        });
+
+        terminal.update(cx, |_terminal, cx| {
+            for _ in 0..10 {
+                cx.emit(Event::Wakeup);
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            event_counter.read_with(cx, |counter, _| counter.update_tab_count),
+            1
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(99));
+        cx.run_until_parked();
+        assert_eq!(
+            event_counter.read_with(cx, |counter, _| counter.update_tab_count),
+            1
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(
+            event_counter.read_with(cx, |counter, _| counter.update_tab_count),
+            2
+        );
+    }
 
     #[gpui::test]
     async fn test_custom_title_initially_none(cx: &mut TestAppContext) {

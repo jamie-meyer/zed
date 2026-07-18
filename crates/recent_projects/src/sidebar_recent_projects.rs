@@ -105,10 +105,12 @@ impl Focusable for SidebarRecentProjects {
 }
 
 impl Render for SidebarRecentProjects {
-    fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("SidebarRecentProjects")
             .w(rems(18.))
+            .elevation_2(cx)
+            .overflow_hidden()
             .child(self.picker.clone())
     }
 }
