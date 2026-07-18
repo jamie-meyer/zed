@@ -8,9 +8,11 @@ target_dir="release"
 open_result=false
 local_install=false
 can_code_sign=false
+use_installed_signing_identity=false
+use_notarization_keychain_profile=false
 
 # This must match the team in the provisioning profile.
-IDENTITY="Zed Industries, Inc."
+IDENTITY="${MACOS_SIGNING_IDENTITY:-Zed Industries, Inc.}"
 APPLE_NOTARIZATION_TEAM="MQ55VZLNZQ"
 
 # Function for displaying help info
@@ -95,6 +97,9 @@ cargo build ${build_flag} --package remote_server --target $target_triple
 echo "Creating application bundle"
 pushd crates/zed
 cp Cargo.toml Cargo.toml.backup
+cargo_manifest_path="$(pwd)/Cargo.toml"
+cargo_manifest_backup_path="${cargo_manifest_path}.backup"
+trap 'if [[ -f "$cargo_manifest_backup_path" ]]; then mv "$cargo_manifest_backup_path" "$cargo_manifest_path"; fi' EXIT
 sed \
     -i.backup \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
@@ -103,6 +108,7 @@ sed \
 app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
 
 mv Cargo.toml.backup Cargo.toml
+trap - EXIT
 popd
 echo "Bundled ${app_path}"
 
@@ -117,7 +123,11 @@ else
     echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
 fi
 
-if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+if [[ -n "${MACOS_SIGNING_IDENTITY:-}" && -n "${APPLE_NOTARIZATION_KEYCHAIN_PROFILE:-}" ]]; then
+    can_code_sign=true
+    use_installed_signing_identity=true
+    use_notarization_keychain_profile=true
+elif [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
     can_code_sign=true
 
     echo "Setting up keychain for code signing..."
@@ -195,8 +205,10 @@ function sign_app_binaries() {
     echo "Downloading git binary"
     download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
 
-    # Note: The app identifier for our development builds is the same as the app identifier for nightly.
-    cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
+    if [[ $use_installed_signing_identity = false ]]; then
+        # Note: The app identifier for our development builds is the same as the app identifier for nightly.
+        cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
+    fi
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing binaries"
@@ -251,8 +263,6 @@ function sign_app_binaries() {
         rm -rf ${dmg_source_directory}
         mkdir -p ${dmg_source_directory}
         mv "${app_path}" "${dmg_source_directory}"
-        notarization_key_file=$(mktemp)
-
         echo "Adding symlink to /Applications to ${dmg_source_directory}"
         ln -s /Applications ${dmg_source_directory}
 
@@ -271,9 +281,14 @@ function sign_app_binaries() {
         if [[ $can_code_sign = true ]]; then
             echo "Notarizing DMG with Apple"
             /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "$(pwd)/${dmg_file_path}" -v
-            echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
-            "${xcode_bin_dir_path}/notarytool" submit --wait --key "$notarization_key_file" --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER_ID" "${dmg_file_path}"
-            rm "$notarization_key_file"
+            if [[ $use_notarization_keychain_profile = true ]]; then
+                "${xcode_bin_dir_path}/notarytool" submit --wait --keychain-profile "$APPLE_NOTARIZATION_KEYCHAIN_PROFILE" "${dmg_file_path}"
+            else
+                notarization_key_file=$(mktemp)
+                echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
+                "${xcode_bin_dir_path}/notarytool" submit --wait --key "$notarization_key_file" --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER_ID" "${dmg_file_path}"
+                rm "$notarization_key_file"
+            fi
             "${xcode_bin_dir_path}/stapler" staple "${dmg_file_path}"
         fi
 
