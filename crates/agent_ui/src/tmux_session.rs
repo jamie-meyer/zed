@@ -199,12 +199,72 @@ pub(crate) async fn ensure_session(
 }
 
 async fn configure_session(name: &str, terminal_id: TerminalId) -> Result<()> {
+    set_server_option("extended-keys", "always").await?;
+    set_server_option("extended-keys-format", "csi-u").await?;
+    ensure_server_option_contains("terminal-features", "xterm*:extkeys").await?;
     set_session_option(name, "@zed-managed", "1").await?;
     set_session_option(name, "@zed-terminal-id", &terminal_id.to_key_string()).await?;
     set_session_option(name, "mouse", "on").await?;
     set_session_option(name, "remain-on-exit", "on").await?;
     set_session_option(name, "status-right", "%Y-%m-%d  %H:%M ").await?;
     Ok(())
+}
+
+async fn set_server_option(option: &str, value: &str) -> Result<()> {
+    let output = tmux_command()
+        .await?
+        .args(["set-option", "-s", option, value])
+        .output()
+        .await
+        .with_context(|| format!("failed to configure tmux server option {option}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to configure tmux server option {option}: {}",
+            command_error(&output)
+        )
+    }
+}
+
+async fn ensure_server_option_contains(option: &str, value: &str) -> Result<()> {
+    let output = tmux_command()
+        .await?
+        .args(["show-options", "-sv", option])
+        .output()
+        .await
+        .with_context(|| format!("failed to query tmux server option {option}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to query tmux server option {option}: {}",
+            command_error(&output)
+        );
+    }
+    if server_option_contains(&String::from_utf8_lossy(&output.stdout), value) {
+        return Ok(());
+    }
+
+    let value = format!(",{value}");
+    let output = tmux_command()
+        .await?
+        .args(["set-option", "-sa", option, &value])
+        .output()
+        .await
+        .with_context(|| format!("failed to extend tmux server option {option}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to extend tmux server option {option}: {}",
+            command_error(&output)
+        )
+    }
+}
+
+fn server_option_contains(current: &str, value: &str) -> bool {
+    current
+        .split([',', '\n'])
+        .any(|entry| entry.trim() == value)
 }
 
 pub(crate) async fn kill_session(terminal_id: TerminalId) -> Result<()> {
@@ -672,6 +732,23 @@ mod tests {
                 session_name(terminal_id).as_str(),
             ]
         );
+    }
+
+    #[test]
+    fn server_option_list_values_are_added_idempotently() {
+        assert!(server_option_contains(
+            "xterm*:RGB,xterm*:extkeys",
+            "xterm*:extkeys"
+        ));
+        assert!(server_option_contains(
+            "xterm*:RGB, xterm*:extkeys\n",
+            "xterm*:extkeys"
+        ));
+        assert!(server_option_contains(
+            "xterm*:RGB\nxterm*:extkeys\n",
+            "xterm*:extkeys"
+        ));
+        assert!(!server_option_contains("xterm*:RGB", "xterm*:extkeys"));
     }
 
     #[test]

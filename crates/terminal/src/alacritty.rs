@@ -322,7 +322,9 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
 
 impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
-        self.0.unbounded_send(PtyEvent::Event(event.into())).ok();
+        if let Err(error) = self.0.unbounded_send(PtyEvent::Event(event.into())) {
+            log::debug!("failed to send terminal backend event: {error}");
+        }
     }
 }
 
@@ -602,6 +604,12 @@ impl Modes {
         add_alacritty_mode(&mut mode, self, Self::MOUSE_DRAG, TermMode::MOUSE_DRAG);
         add_alacritty_mode(&mut mode, self, Self::MOUSE_MOTION, TermMode::MOUSE_MOTION);
         add_alacritty_mode(&mut mode, self, Self::VI, TermMode::VI);
+        add_alacritty_mode(
+            &mut mode,
+            self,
+            Self::DISAMBIGUATE_ESC_CODES,
+            TermMode::DISAMBIGUATE_ESC_CODES,
+        );
         mode
     }
 }
@@ -695,6 +703,12 @@ fn terminal_modes_from_alacritty(mode: TermMode) -> Modes {
         Modes::MOUSE_MOTION,
     );
     add_terminal_mode(&mut terminal_modes, mode, TermMode::VI, Modes::VI);
+    add_terminal_mode(
+        &mut terminal_modes,
+        mode,
+        TermMode::DISAMBIGUATE_ESC_CODES,
+        Modes::DISAMBIGUATE_ESC_CODES,
+    );
     terminal_modes
 }
 
@@ -1045,7 +1059,8 @@ mod tests {
             | TermMode::ALT_SCREEN
             | TermMode::MOUSE_DRAG
             | TermMode::SGR_MOUSE
-            | TermMode::VI;
+            | TermMode::VI
+            | TermMode::DISAMBIGUATE_ESC_CODES;
 
         let terminal_modes = terminal_modes_from_alacritty(alacritty_modes);
         assert!(terminal_modes.contains(Modes::APP_CURSOR));
@@ -1055,6 +1070,7 @@ mod tests {
         assert!(terminal_modes.intersects(Modes::MOUSE_MODE));
         assert!(terminal_modes.contains(Modes::SGR_MOUSE));
         assert!(terminal_modes.contains(Modes::VI));
+        assert!(terminal_modes.contains(Modes::DISAMBIGUATE_ESC_CODES));
         assert!(!terminal_modes.contains(Modes::MOUSE_REPORT_CLICK));
 
         let alacritty_modes = terminal_modes.to_alacritty();
@@ -1064,6 +1080,7 @@ mod tests {
         assert!(alacritty_modes.contains(TermMode::MOUSE_DRAG));
         assert!(alacritty_modes.contains(TermMode::SGR_MOUSE));
         assert!(alacritty_modes.contains(TermMode::VI));
+        assert!(alacritty_modes.contains(TermMode::DISAMBIGUATE_ESC_CODES));
         assert!(!alacritty_modes.contains(TermMode::MOUSE_REPORT_CLICK));
     }
 

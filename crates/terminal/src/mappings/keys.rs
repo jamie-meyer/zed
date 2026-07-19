@@ -57,6 +57,9 @@ pub(crate) fn to_esc_str(
         ("tab", TerminalModifiers::None) => Some("\x09"),
         ("escape", TerminalModifiers::None) => Some("\x1b"),
         ("enter", TerminalModifiers::None) => Some("\x0d"),
+        ("enter", TerminalModifiers::Shift) if mode.contains(Modes::DISAMBIGUATE_ESC_CODES) => {
+            Some("\x1b[13;2u")
+        }
         ("enter", TerminalModifiers::Shift) => Some("\x0a"),
         ("enter", TerminalModifiers::Alt) => Some("\x1b\x0d"),
         ("backspace", TerminalModifiers::None) => Some("\x7f"),
@@ -381,16 +384,27 @@ mod test {
     }
 
     #[test]
-    fn test_shift_enter_newline() {
+    fn test_shift_enter_uses_csi_u_when_requested() {
         let shift_enter = Keystroke::parse("shift-enter").unwrap();
         let regular_enter = Keystroke::parse("enter").unwrap();
-        let mode = Modes::NONE;
 
-        // Shift-enter should send line feed (newline)
-        assert_eq!(to_esc_str(&shift_enter, mode, false), Some("\x0a".into()));
+        assert_eq!(
+            to_esc_str(&shift_enter, Modes::DISAMBIGUATE_ESC_CODES, false),
+            Some("\x1b[13;2u".into())
+        );
+        assert_eq!(
+            to_esc_str(&regular_enter, Modes::DISAMBIGUATE_ESC_CODES, false),
+            Some("\x0d".into())
+        );
+    }
 
-        // Regular enter should still send carriage return
-        assert_eq!(to_esc_str(&regular_enter, mode, false), Some("\x0d".into()));
+    #[test]
+    fn test_shift_enter_falls_back_to_line_feed() {
+        let shift_enter = Keystroke::parse("shift-enter").unwrap();
+        assert_eq!(
+            to_esc_str(&shift_enter, Modes::NONE, false),
+            Some("\x0a".into())
+        );
     }
 
     #[test]

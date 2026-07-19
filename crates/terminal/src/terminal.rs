@@ -351,6 +351,7 @@ impl Modes {
     pub const MOUSE_DRAG: Self = Self(1 << 14);
     pub const MOUSE_MOTION: Self = Self(1 << 15);
     pub const VI: Self = Self(1 << 16);
+    pub const DISAMBIGUATE_ESC_CODES: Self = Self(1 << 17);
     pub const MOUSE_MODE: Self =
         Self(Self::MOUSE_REPORT_CLICK.0 | Self::MOUSE_DRAG.0 | Self::MOUSE_MOTION.0);
 
@@ -934,6 +935,7 @@ impl TerminalBuilder {
                 path_hyperlink_regexes: Vec::default(),
                 path_hyperlink_timeout_ms: 0,
                 window_id,
+                force_extended_keys: false,
             },
             child_exited: None,
             keyboard_input_sent: false,
@@ -966,6 +968,7 @@ impl TerminalBuilder {
         cx: &App,
         activation_script: Vec<String>,
         path_style: PathStyle,
+        force_extended_keys: bool,
     ) -> Task<Result<TerminalBuilder>> {
         let version = release_channel::AppVersion::global(cx);
         let background_executor = cx.background_executor().clone();
@@ -1157,6 +1160,7 @@ impl TerminalBuilder {
                     path_hyperlink_regexes,
                     path_hyperlink_timeout_ms,
                     window_id,
+                    force_extended_keys,
                 },
                 child_exited: None,
                 keyboard_input_sent: false,
@@ -1335,6 +1339,7 @@ struct CopyTemplate {
     path_hyperlink_regexes: Vec<String>,
     path_hyperlink_timeout_ms: u64,
     window_id: u64,
+    force_extended_keys: bool,
 }
 
 #[derive(Debug)]
@@ -1995,7 +2000,11 @@ impl Terminal {
         }
 
         // Keep default terminal behavior
-        let esc = to_esc_str(keystroke, self.last_content.mode, option_as_meta);
+        let mut mode = self.last_content.mode;
+        if self.template.force_extended_keys {
+            mode.insert(Modes::DISAMBIGUATE_ESC_CODES);
+        }
+        let esc = to_esc_str(keystroke, mode, option_as_meta);
         if let Some(esc) = esc {
             match esc {
                 Cow::Borrowed(string) => self.input(string.as_bytes()),
@@ -2665,6 +2674,7 @@ impl Terminal {
             cx,
             self.activation_script.clone(),
             self.path_style,
+            self.template.force_extended_keys,
         )
     }
 }
@@ -3017,6 +3027,7 @@ mod tests {
                     cx,
                     vec![],
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -3176,6 +3187,7 @@ mod tests {
                     cx,
                     Vec::new(),
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -3244,6 +3256,7 @@ mod tests {
                     cx,
                     Vec::new(),
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -3310,6 +3323,7 @@ mod tests {
                     cx,
                     Vec::new(),
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -3917,6 +3931,7 @@ mod tests {
                         cx,
                         vec![],
                         PathStyle::local(),
+                        false,
                     )
                 })
                 .await
