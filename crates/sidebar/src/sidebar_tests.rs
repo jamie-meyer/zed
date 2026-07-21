@@ -4,8 +4,8 @@ use agent::ThreadStore;
 use agent_ui::{
     ThreadId,
     terminal_thread_metadata_store::{
-        TerminalThreadMetadata, TerminalThreadMetadataStore, TerminalThreadStatusStore,
-        TestTerminalMetadataDbName,
+        TerminalThreadKind, TerminalThreadMetadata, TerminalThreadMetadataStore,
+        TerminalThreadRegistryMetadata, TerminalThreadStatusStore, TestTerminalMetadataDbName,
     },
     test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -1882,11 +1882,14 @@ async fn test_terminal_status_store_updates_sidebar_entry(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut TestAppContext) {
+async fn test_closing_last_agent_panel_terminal_returns_to_workspace(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
 
     assert_project_header_has_threads(&sidebar, "my-project", false, cx);
 
@@ -1917,21 +1920,22 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
     });
     cx.run_until_parked();
 
-    panel.read_with(cx, |panel, cx| {
+    panel.read_with(cx, |panel, _cx| {
         assert!(!panel.has_terminal(terminal_id));
+    });
+    assert!(!workspace.read_with(cx, |_, cx| AgentPanel::is_visible(&workspace, cx)));
+    sidebar.read_with(cx, |sidebar, _cx| {
         assert!(
-            panel.active_view_is_new_draft(cx),
-            "closing the active terminal should leave the panel on its empty draft"
+            sidebar.active_entry.is_none(),
+            "closing the last terminal should select the workspace, got {:?}",
+            sidebar.active_entry
         );
     });
-    // Closing the terminal drops the user back onto the panel's empty
-    // draft. The sidebar mirrors that with a "New {agent} Thread"
-    // placeholder row, so the header reports having threads.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [my-project]", "  New Zed Agent Thread"]
+        vec!["v [my-project]"]
     );
-    assert_project_header_has_threads(&sidebar, "my-project", true, cx);
+    assert_project_header_has_threads(&sidebar, "my-project", false, cx);
 
     let project_group_key = multi_workspace.read_with(cx, |multi_workspace, cx| {
         multi_workspace.workspace().read(cx).project_group_key(cx)
@@ -1941,13 +1945,11 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
     });
     cx.run_until_parked();
 
-    // Collapsed: header hides children but still reports the placeholder
-    // as a thread present in the group.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec!["> [my-project]"]
     );
-    assert_project_header_has_threads(&sidebar, "my-project", true, cx);
+    assert_project_header_has_threads(&sidebar, "my-project", false, cx);
 }
 
 #[gpui::test]
@@ -2043,6 +2045,11 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         remote_connection: None,
         working_directory: None,
         initial_command: None,
+        registry: TerminalThreadRegistryMetadata::detached(
+            terminal_id,
+            TerminalThreadKind::Shell,
+            None,
+        ),
     };
 
     cx.update(|_, cx| {
@@ -3386,6 +3393,11 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         remote_connection: None,
         working_directory: None,
         initial_command: None,
+        registry: TerminalThreadRegistryMetadata::detached(
+            terminal_id,
+            TerminalThreadKind::Shell,
+            None,
+        ),
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3494,6 +3506,11 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         remote_connection: None,
         working_directory: None,
         initial_command: None,
+        registry: TerminalThreadRegistryMetadata::detached(
+            terminal_id,
+            TerminalThreadKind::Shell,
+            None,
+        ),
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3643,6 +3660,11 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         remote_connection: None,
         working_directory: None,
         initial_command: None,
+        registry: TerminalThreadRegistryMetadata::detached(
+            terminal_id,
+            TerminalThreadKind::Shell,
+            None,
+        ),
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -4128,6 +4150,155 @@ async fn test_closing_active_agent_panel_terminal_activates_neighbor(cx: &mut Te
         visible_entries_as_strings(&sidebar, cx),
         vec!["v [my-project]", "  Build"]
     );
+}
+
+#[gpui::test]
+async fn test_closing_last_terminal_does_not_activate_another_worktree(cx: &mut TestAppContext) {
+    agent_ui::test_support::init_test(cx);
+    cx.update(|cx| {
+        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        ThreadStore::init_global(cx);
+        ThreadMetadataStore::init_global(cx);
+        language_model::LanguageModelRegistry::test(cx);
+        prompt_store::init(cx);
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project", serde_json::json!({ ".git": {}, "src": {} }))
+        .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/project-feature"),
+            ref_name: Some("refs/heads/feature".into()),
+            sha: "abc".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project = project::Project::test(fs, ["/project-feature".as_ref()], cx).await;
+    main_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let main_workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let main_panel = add_agent_panel(&main_workspace, cx);
+    let main_terminal = main_panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Main", true, window, cx)
+        })
+        .expect("main terminal should be inserted");
+
+    let worktree_workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(worktree_project, window, cx)
+    });
+    let worktree_panel = add_agent_panel(&worktree_workspace, cx);
+    let worktree_terminal = worktree_panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Feature", true, window, cx)
+        })
+        .expect("worktree terminal should be inserted");
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.thread_grouping = ThreadGroupingMode::Worktree;
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+
+    let (metadata, terminal_workspace) = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal)
+                    if terminal.metadata.terminal_id == worktree_terminal =>
+                {
+                    Some((terminal.metadata.clone(), terminal.workspace.clone()))
+                }
+                _ => None,
+            })
+            .expect("worktree terminal should be visible")
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.close_terminal(&metadata, &terminal_workspace, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.workspace().clone()
+        }),
+        worktree_workspace
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _cx| multi_workspace
+            .workspaces()
+            .count()),
+        2,
+        "closing a terminal in worktree view should keep the worktree open"
+    );
+    assert!(!worktree_workspace.read_with(cx, |_, cx| {
+        AgentPanel::is_visible(&worktree_workspace, cx)
+    }));
+    main_panel.read_with(cx, |panel, _cx| {
+        assert!(panel.has_terminal(main_terminal));
+        assert_eq!(panel.active_terminal_id(), Some(main_terminal));
+    });
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(
+            sidebar.active_entry.is_none(),
+            "another worktree's terminal must not become active, got {:?}",
+            sidebar.active_entry
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_selecting_worktree_hides_agent_panel_without_closing_terminal(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Codex", true, window, cx)
+        })
+        .expect("terminal should be inserted");
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(workspace.read_with(cx, |_, cx| AgentPanel::is_visible(&workspace, cx)));
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.activate_worktree_workspace(&workspace, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(!workspace.read_with(cx, |_, cx| AgentPanel::is_visible(&workspace, cx)));
+    panel.read_with(cx, |panel, _cx| {
+        assert!(panel.has_terminal(terminal_id));
+        assert_eq!(panel.active_terminal_id(), Some(terminal_id));
+    });
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(sidebar.active_entry.is_none());
+    });
 }
 
 #[gpui::test]

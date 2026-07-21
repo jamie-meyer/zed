@@ -2116,7 +2116,7 @@ impl Sidebar {
         cx.spawn_in(window, async move |this, cx| {
             let workspace = task.await?;
             this.update_in(cx, |this, window, cx| match target {
-                NewEntryTarget::Codex => this.create_new_entry(&workspace, window, cx),
+                NewEntryTarget::Codex => this.ensure_codex_terminal(&workspace, window, cx),
                 NewEntryTarget::Terminal => this.create_new_terminal(&workspace, window, cx),
             })?;
             anyhow::Ok(())
@@ -5537,6 +5537,27 @@ impl Sidebar {
             .find_map(ActivatableEntry::from_list_entry)
     }
 
+    fn neighboring_terminal_in_worktree(
+        &self,
+        current_position: usize,
+        folder_paths: &PathList,
+    ) -> Option<ActivatableEntry> {
+        let after = self
+            .contents
+            .entries
+            .get(current_position.checked_add(1)?..)?;
+        let before = self.contents.entries.get(..current_position)?;
+        after.iter().chain(before.iter().rev()).find_map(|entry| {
+            let ListEntry::Terminal(terminal) = entry else {
+                return None;
+            };
+            (terminal.metadata.folder_paths() == folder_paths).then(|| ActivatableEntry::Terminal {
+                metadata: terminal.metadata.clone(),
+                workspace: terminal.workspace.clone(),
+            })
+        })
+    }
+
     fn activate_entry(
         &mut self,
         entry: &ActivatableEntry,
@@ -6154,7 +6175,9 @@ impl Sidebar {
                         if terminal.metadata.terminal_id == terminal_id
                 )
             })
-            .and_then(|position| self.neighboring_activatable_entry(position));
+            .and_then(|position| {
+                self.neighboring_terminal_in_worktree(position, metadata.folder_paths())
+            });
 
         let terminal_folder_paths = metadata.folder_paths().clone();
         let archive_worktree_checkouts = self.thread_grouping != ThreadGroupingMode::Worktree;
@@ -6256,15 +6279,11 @@ impl Sidebar {
                             cx,
                         );
                     }
-                    // If the terminal's workspace has already been removed,
-                    // don't synthesize a fallback draft in the detached
-                    // AgentPanel.
                     this.close_terminal_entry(
                         &metadata,
                         &workspace,
                         is_active,
                         neighbor.as_ref(),
-                        !terminal_workspace_removed,
                         roots_to_archive,
                         window,
                         cx,
@@ -6288,7 +6307,6 @@ impl Sidebar {
                         &workspace,
                         is_active,
                         neighbor.as_ref(),
-                        true,
                         roots_to_archive,
                         window,
                         cx,
@@ -6303,7 +6321,6 @@ impl Sidebar {
                 workspace,
                 is_active,
                 neighbor.as_ref(),
-                true,
                 roots_to_archive,
                 window,
                 cx,
@@ -6317,11 +6334,16 @@ impl Sidebar {
         workspace: &ThreadEntryWorkspace,
         is_active: bool,
         neighbor: Option<&ActivatableEntry>,
-        activate_panel_draft: bool,
         roots_to_archive: Vec<thread_worktree_archive::RootPlan>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+            store.update(cx, |store, cx| {
+                store.mark_stopping(metadata.terminal_id, cx);
+            });
+        }
+
         #[cfg(any(test, feature = "test-support"))]
         {
             self.close_terminal_entry_after_tmux_killed(
@@ -6329,7 +6351,6 @@ impl Sidebar {
                 workspace,
                 is_active,
                 neighbor,
-                activate_panel_draft,
                 roots_to_archive,
                 window,
                 cx,
@@ -6349,7 +6370,6 @@ impl Sidebar {
                         &workspace,
                         is_active,
                         neighbor.as_ref(),
-                        activate_panel_draft,
                         roots_to_archive,
                         window,
                         cx,
@@ -6372,7 +6392,6 @@ impl Sidebar {
         workspace: &ThreadEntryWorkspace,
         is_active: bool,
         neighbor: Option<&ActivatableEntry>,
-        activate_panel_draft: bool,
         roots_to_archive: Vec<thread_worktree_archive::RootPlan>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -6385,12 +6404,7 @@ impl Sidebar {
             workspace.update(cx, |workspace, cx| {
                 if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                     panel.update(cx, |panel, cx| {
-                        panel.close_terminal_after_tmux_killed(
-                            terminal_id,
-                            activate_panel_draft && neighbor.is_none(),
-                            window,
-                            cx,
-                        );
+                        panel.close_terminal_after_tmux_killed(terminal_id, false, window, cx);
                     });
                 }
             });
@@ -6409,6 +6423,23 @@ impl Sidebar {
                 .as_ref()
                 .is_some_and(|neighbor| self.activate_entry(neighbor, window, cx))
             {
+                return;
+            }
+            let retained_workspace = match workspace {
+                ThreadEntryWorkspace::Open(workspace) => self
+                    .multi_workspace
+                    .upgrade()
+                    .is_some_and(|multi_workspace| {
+                        multi_workspace
+                            .read(cx)
+                            .workspaces()
+                            .any(|candidate| candidate == workspace)
+                    })
+                    .then_some(workspace),
+                ThreadEntryWorkspace::Closed { .. } => None,
+            };
+            if let Some(workspace) = retained_workspace {
+                self.activate_worktree_workspace(workspace, window, cx);
                 return;
             }
             self.sync_active_entry_from_active_workspace(cx);
@@ -8928,6 +8959,39 @@ impl Sidebar {
         });
     }
 
+    fn ensure_codex_terminal(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if workspace_path_list(workspace, cx).paths().is_empty() {
+            return;
+        }
+
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.activate(workspace.clone(), None, window, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.ensure_codex_terminal(
+                        Some(workspace),
+                        AgentThreadSource::Sidebar,
+                        window,
+                        cx,
+                    );
+                });
+            }
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+    }
+
     fn selected_group_key(&self) -> Option<ProjectGroupKey> {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
@@ -9006,16 +9070,14 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if entry.is_current {
-            return;
-        }
-
         if let Some(workspace) =
             self.workspace_for_worktree_path(&entry.group_key, entry.path(), cx)
         {
-            self.activate_workspace(&workspace, window, cx);
-            self.selection = None;
-            self.active_entry = None;
+            self.activate_worktree_workspace(&workspace, window, cx);
+            return;
+        }
+
+        if entry.is_current {
             return;
         }
 
@@ -9038,6 +9100,22 @@ impl Sidebar {
         });
         self.selection = None;
         self.active_entry = None;
+    }
+
+    fn activate_worktree_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_workspace(workspace, window, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_panel::<AgentPanel>(window, cx);
+            workspace.focus_handle(cx).focus(window, cx);
+        });
+        self.selection = None;
+        self.active_entry = None;
+        self.update_entries(cx);
     }
 
     fn open_worktree_in_new_window(
@@ -9124,7 +9202,7 @@ impl Sidebar {
             remote_connection::dismiss_connection_modal(&modal_workspace, cx);
             let workspace = result?;
             this.update_in(cx, |this, window, cx| {
-                this.create_new_codex_terminal(&workspace, window, cx);
+                this.ensure_codex_terminal(&workspace, window, cx);
             })?;
             anyhow::Ok(())
         })
@@ -9274,6 +9352,16 @@ impl Sidebar {
                 if prompt.await? != 0 {
                     return anyhow::Ok(());
                 }
+
+                cx.update(|_window, cx| {
+                    if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+                        store.update(cx, |store, cx| {
+                            for terminal_id in &terminal_ids {
+                                store.mark_stopping(*terminal_id, cx);
+                            }
+                        });
+                    }
+                })?;
 
                 if let Some(teardown_context) = teardown_context {
                     run_remove_worktree_tasks(teardown_context, path.clone(), cx).await?;

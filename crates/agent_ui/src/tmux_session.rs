@@ -18,6 +18,10 @@ use ui::AgentThreadStatus;
 #[cfg(not(any(test, feature = "test-support")))]
 use util::ResultExt as _;
 
+use crate::terminal_thread_metadata_store::{
+    TERMINAL_THREAD_TMUX_SERVER_NAME, TerminalThreadKind, TerminalThreadProvider,
+    terminal_thread_tmux_session_name,
+};
 #[cfg(not(any(test, feature = "test-support")))]
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadataStore, TerminalThreadStatusStore, terminal_title_for_persistence,
@@ -27,7 +31,6 @@ use crate::{
     agent_panel::{codex_status_from_title, terminal_status_from_process_and_title},
 };
 
-const TMUX_SERVER_NAME: &str = "zed-terminal-threads";
 #[cfg(not(any(test, feature = "test-support")))]
 const TMUX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 static TMUX_PROGRAM: OnceLock<PathBuf> = OnceLock::new();
@@ -58,6 +61,13 @@ struct SessionSnapshot {
 struct PaneActivityState {
     activity: Option<u64>,
     needs_follow_up_capture: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TmuxSessionRecoveryMetadata {
+    pub worktree_path: Option<PathBuf>,
+    pub kind: TerminalThreadKind,
+    pub provider: Option<TerminalThreadProvider>,
 }
 
 impl TmuxSessionManager {
@@ -134,10 +144,6 @@ impl TmuxSessionManager {
     }
 }
 
-pub(crate) fn session_name(terminal_id: TerminalId) -> String {
-    format!("zed-{}", terminal_id.to_key_string())
-}
-
 pub(crate) fn attach_shell(terminal_id: TerminalId) -> Shell {
     Shell::WithArguments {
         program: TMUX_PROGRAM
@@ -147,10 +153,10 @@ pub(crate) fn attach_shell(terminal_id: TerminalId) -> Shell {
         args: vec![
             "-u".to_string(),
             "-L".to_string(),
-            TMUX_SERVER_NAME.to_string(),
+            TERMINAL_THREAD_TMUX_SERVER_NAME.to_string(),
             "attach-session".to_string(),
             "-t".to_string(),
-            session_name(terminal_id),
+            terminal_thread_tmux_session_name(terminal_id),
         ],
         title_override: Some("Codex".to_string()),
     }
@@ -159,10 +165,11 @@ pub(crate) fn attach_shell(terminal_id: TerminalId) -> Shell {
 pub(crate) async fn ensure_session(
     terminal_id: TerminalId,
     working_directory: Option<&Path>,
+    recovery_metadata: &TmuxSessionRecoveryMetadata,
 ) -> Result<bool> {
-    let name = session_name(terminal_id);
+    let name = terminal_thread_tmux_session_name(terminal_id);
     if has_session(&name).await? {
-        configure_session(&name, terminal_id).await?;
+        configure_session(&name, terminal_id, recovery_metadata).await?;
         return Ok(false);
     }
 
@@ -186,7 +193,7 @@ pub(crate) async fn ensure_session(
         );
     }
 
-    if let Err(error) = configure_session(&name, terminal_id).await {
+    if let Err(error) = configure_session(&name, terminal_id, recovery_metadata).await {
         if let Err(cleanup_error) = kill_session(terminal_id).await {
             log::warn!(
                 "failed to clean up tmux session {name} after configuration error: {cleanup_error:#}"
@@ -198,16 +205,51 @@ pub(crate) async fn ensure_session(
     Ok(true)
 }
 
-async fn configure_session(name: &str, terminal_id: TerminalId) -> Result<()> {
+async fn configure_session(
+    name: &str,
+    terminal_id: TerminalId,
+    recovery_metadata: &TmuxSessionRecoveryMetadata,
+) -> Result<()> {
     set_server_option("extended-keys", "always").await?;
     set_server_option("extended-keys-format", "csi-u").await?;
     ensure_server_option_contains("terminal-features", "xterm*:extkeys").await?;
-    set_session_option(name, "@zed-managed", "1").await?;
-    set_session_option(name, "@zed-terminal-id", &terminal_id.to_key_string()).await?;
+    for (option, value) in recovery_session_options(terminal_id, recovery_metadata) {
+        set_session_option(name, option, &value).await?;
+    }
     set_session_option(name, "mouse", "on").await?;
     set_session_option(name, "remain-on-exit", "on").await?;
     set_session_option(name, "status-right", "%Y-%m-%d  %H:%M ").await?;
     Ok(())
+}
+
+fn recovery_session_options(
+    terminal_id: TerminalId,
+    recovery_metadata: &TmuxSessionRecoveryMetadata,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("@zed-managed", "1".to_string()),
+        ("@zed-terminal-id", terminal_id.to_key_string()),
+        (
+            "@zed-worktree-path",
+            recovery_metadata
+                .worktree_path
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        (
+            "@zed-terminal-kind",
+            recovery_metadata.kind.as_str().to_string(),
+        ),
+        (
+            "@zed-provider",
+            recovery_metadata
+                .provider
+                .map(TerminalThreadProvider::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    ]
 }
 
 async fn set_server_option(option: &str, value: &str) -> Result<()> {
@@ -268,7 +310,7 @@ fn server_option_contains(current: &str, value: &str) -> bool {
 }
 
 pub(crate) async fn kill_session(terminal_id: TerminalId) -> Result<()> {
-    let name = session_name(terminal_id);
+    let name = terminal_thread_tmux_session_name(terminal_id);
     let output = tmux_command()
         .await?
         .args(["kill-session", "-t", &name])
@@ -558,29 +600,11 @@ fn is_codex_command(command: &str) -> bool {
     command == "codex" || command.starts_with("codex-")
 }
 
-fn is_codex_initial_command(command: &str) -> bool {
-    command
-        .split_whitespace()
-        .next()
-        .map(|executable| executable.trim_matches(['\'', '"']))
-        .and_then(|executable| Path::new(executable).file_name())
-        .and_then(|executable| executable.to_str())
-        .is_some_and(is_codex_command)
-}
-
 #[cfg(not(any(test, feature = "test-support")))]
 fn metadata_uses_codex(
     metadata: &crate::terminal_thread_metadata_store::TerminalThreadMetadata,
 ) -> bool {
-    launch_metadata_uses_codex(
-        metadata.initial_command.as_deref(),
-        metadata.custom_title.as_deref(),
-    )
-}
-
-fn launch_metadata_uses_codex(initial_command: Option<&str>, custom_title: Option<&str>) -> bool {
-    initial_command.is_some_and(is_codex_initial_command)
-        || initial_command.is_none() && custom_title == Some("Codex")
+    metadata.registry.provider == Some(TerminalThreadProvider::Codex)
 }
 
 fn codex_status_from_screen(screen: &str) -> Option<AgentThreadStatus> {
@@ -622,7 +646,7 @@ fn codex_status_from_screen(screen: &str) -> Option<AgentThreadStatus> {
 
 async fn tmux_command() -> Result<Command> {
     let mut command = Command::new(tmux_program().await?);
-    command.args(["-u", "-L", TMUX_SERVER_NAME]);
+    command.args(["-u", "-L", TERMINAL_THREAD_TMUX_SERVER_NAME]);
     Ok(command)
 }
 
@@ -726,10 +750,34 @@ mod tests {
             [
                 "-u",
                 "-L",
-                TMUX_SERVER_NAME,
+                TERMINAL_THREAD_TMUX_SERVER_NAME,
                 "attach-session",
                 "-t",
-                session_name(terminal_id).as_str(),
+                terminal_thread_tmux_session_name(terminal_id).as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_options_include_worktree_and_agent_identity() {
+        let terminal_id = TerminalId::new();
+        let options = recovery_session_options(
+            terminal_id,
+            &TmuxSessionRecoveryMetadata {
+                worktree_path: Some(PathBuf::from("/project-feature")),
+                kind: TerminalThreadKind::Agent,
+                provider: Some(TerminalThreadProvider::Codex),
+            },
+        );
+
+        assert_eq!(
+            options,
+            vec![
+                ("@zed-managed", "1".to_string()),
+                ("@zed-terminal-id", terminal_id.to_key_string()),
+                ("@zed-worktree-path", "/project-feature".to_string()),
+                ("@zed-terminal-kind", "agent".to_string()),
+                ("@zed-provider", "codex".to_string()),
             ]
         );
     }
@@ -822,20 +870,6 @@ mod tests {
             status_for_snapshot(Some(&snapshot), true, AgentThreadStatus::Completed),
             AgentThreadStatus::Completed
         );
-    }
-
-    #[test]
-    fn recognizes_codex_from_persisted_initial_command() {
-        assert!(is_codex_initial_command("codex"));
-        assert!(is_codex_initial_command("codex --profile work"));
-        assert!(is_codex_initial_command(
-            "/opt/homebrew/bin/codex --sandbox read-only"
-        ));
-        assert!(!is_codex_initial_command("fish"));
-        assert!(!is_codex_initial_command("echo codex"));
-        assert!(launch_metadata_uses_codex(None, Some("Codex")));
-        assert!(launch_metadata_uses_codex(Some("codex"), Some("Codex")));
-        assert!(!launch_metadata_uses_codex(Some("fish"), Some("Codex")));
     }
 
     #[test]
