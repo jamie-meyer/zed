@@ -49,11 +49,13 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    CloseActiveItem, DraggedSelection, DraggedTab, ItemNavHistory, NewCenterTerminal, NewTerminal,
+    Pane, PanelNavigationTarget, ToolbarItemLocation, Workspace, WorkspaceId,
+    delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
+    pane::{GoBack, GoForward},
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -155,6 +157,9 @@ pub struct TerminalView {
     wakeup_refresh_interval: Option<Duration>,
     last_wakeup_refresh: Option<Instant>,
     pending_wakeup_refresh: Option<Task<()>>,
+    nav_history: Option<ItemNavHistory>,
+    pane: WeakEntity<Pane>,
+    panel_navigation_target: Option<PanelNavigationTarget>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -304,6 +309,9 @@ impl TerminalView {
             wakeup_refresh_interval: None,
             last_wakeup_refresh: None,
             pending_wakeup_refresh: None,
+            nav_history: None,
+            pane: WeakEntity::new_invalid(),
+            panel_navigation_target: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -313,6 +321,10 @@ impl TerminalView {
         self.wakeup_refresh_interval = interval;
         self.last_wakeup_refresh = None;
         self.pending_wakeup_refresh = None;
+    }
+
+    pub fn set_panel_navigation_target(&mut self, target: PanelNavigationTarget) {
+        self.panel_navigation_target = Some(target);
     }
 
     fn emit_wakeup_refresh(&mut self, cx: &mut Context<Self>) {
@@ -1307,6 +1319,67 @@ impl TerminalView {
         }
     }
 
+    fn navigate_backward(&mut self, action: &GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            cx.propagate();
+            return;
+        };
+        if let Some(panel_navigation_target) = self.panel_navigation_target.clone()
+            && let Some(multi_workspace) = workspace
+                .read(cx)
+                .multi_workspace()
+                .and_then(WeakEntity::upgrade)
+        {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .go_back_from_panel(panel_navigation_target, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            return;
+        }
+        let pane = self
+            .pane
+            .upgrade()
+            .or_else(|| workspace.read(cx).pane_for(&cx.entity()))
+            .unwrap_or_else(|| workspace.read(cx).active_pane().clone());
+        pane.update(cx, |pane, cx| {
+            pane.navigate_backward(action, window, cx);
+        });
+    }
+
+    fn navigate_forward(
+        &mut self,
+        action: &GoForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            cx.propagate();
+            return;
+        };
+        if let Some(panel_navigation_target) = self.panel_navigation_target.clone()
+            && let Some(multi_workspace) = workspace
+                .read(cx)
+                .multi_workspace()
+                .and_then(WeakEntity::upgrade)
+        {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .go_forward_from_panel(panel_navigation_target, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            return;
+        }
+        let pane = self
+            .pane
+            .upgrade()
+            .or_else(|| workspace.read(cx).pane_for(&cx.entity()))
+            .unwrap_or_else(|| workspace.read(cx).active_pane().clone());
+        pane.update(cx, |pane, cx| {
+            pane.navigate_forward(action, window, cx);
+        });
+    }
+
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal.update(cx, |terminal, _| {
             terminal.set_cursor_shape(self.cursor_shape);
@@ -1321,6 +1394,18 @@ impl TerminalView {
 
         if should_blink {
             self.blink_manager.update(cx, BlinkManager::enable);
+        }
+
+        if let Some(panel_navigation_target) = self.panel_navigation_target.clone()
+            && let Some(workspace) = self.workspace.upgrade()
+            && let Some(multi_workspace) = workspace
+                .read(cx)
+                .multi_workspace()
+                .and_then(WeakEntity::upgrade)
+        {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.record_panel_focus(&workspace, panel_navigation_target, cx);
+            });
         }
 
         window.invalidate_character_coordinates();
@@ -1383,6 +1468,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::select_all))
             .on_action(cx.listener(TerminalView::rerun_task))
             .on_action(cx.listener(TerminalView::rename_terminal))
+            .on_action(cx.listener(TerminalView::navigate_backward))
+            .on_action(cx.listener(TerminalView::navigate_forward))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1452,6 +1539,23 @@ impl Render for TerminalView {
 
 impl Item for TerminalView {
     type Event = ItemEvent;
+
+    fn set_nav_history(
+        &mut self,
+        history: ItemNavHistory,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.panel_navigation_target = None;
+        self.pane = history.pane();
+        self.nav_history = Some(history);
+    }
+
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(nav_history) = self.nav_history.as_mut() {
+            nav_history.push::<()>(None, None, cx);
+        }
+    }
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
@@ -2262,6 +2366,91 @@ mod tests {
             let input_log = terminal.update(cx, |terminal, _| terminal.take_input_log());
             assert_eq!(input_log, vec![b"foo".to_vec()]);
         });
+    }
+
+    #[gpui::test]
+    async fn pane_navigation_shortcuts_are_not_forwarded_to_terminal(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let (_pane, terminal, _terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-- ctrl-_");
+        cx.run_until_parked();
+
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "pane navigation shortcuts should not be forwarded to the terminal",
+        );
+    }
+
+    #[gpui::test]
+    async fn terminal_participates_in_pane_navigation_history(cx: &mut TestAppContext) {
+        let (project, workspace, window_handle) = init_test_with_window(cx).await;
+        cx.update(load_default_keymap);
+        let file = cx.new(TestItem::new);
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(file.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("test window should exist");
+        let (pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, false, cx);
+        window_handle
+            .update(cx, |_multi_workspace, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.activate_item(0, true, true, window, cx);
+                });
+            })
+            .expect("test window should exist");
+
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(GoBack);
+        cx.run_until_parked();
+        pane.read_with(&cx, |pane, _| {
+            assert_eq!(
+                pane.active_item().map(|item| item.item_id()),
+                Some(terminal_view.entity_id()),
+                "back navigation should return to the terminal",
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-_");
+        cx.run_until_parked();
+        pane.read_with(&cx, |pane, _| {
+            assert_eq!(
+                pane.active_item().map(|item| item.item_id()),
+                Some(file.entity_id()),
+                "forward navigation from the terminal should return to the file",
+            );
+        });
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty(),
+            "forward navigation should not be forwarded to the terminal",
+        );
     }
 
     #[gpui::test]

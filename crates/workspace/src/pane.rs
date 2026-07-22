@@ -481,6 +481,14 @@ struct NavHistoryState {
     pane: WeakEntity<Pane>,
     next_timestamp: Arc<AtomicUsize>,
     preview_item_id: Option<EntityId>,
+    normal_revision: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NavigationHistorySnapshot {
+    pub backward_timestamp: Option<usize>,
+    pub forward_timestamp: Option<usize>,
+    pub normal_revision: usize,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -592,6 +600,7 @@ impl Pane {
                 pane: handle,
                 next_timestamp,
                 preview_item_id: None,
+                normal_revision: 0,
             }))),
             toolbar: cx.new(|_| Toolbar::new()),
             tab_bar_scroll_handle: ScrollHandle::new(),
@@ -679,6 +688,19 @@ impl Pane {
                 self.update_active_tab(self.active_item_index);
             }
             cx.emit(Event::Focus);
+            if let Some(workspace) = self.workspace.upgrade()
+                && let Some(multi_workspace) = workspace
+                    .read(cx)
+                    .multi_workspace()
+                    .and_then(WeakEntity::upgrade)
+            {
+                let pane = cx.entity();
+                window.defer(cx, move |_window, cx| {
+                    multi_workspace.update(cx, |multi_workspace, cx| {
+                        multi_workspace.record_pane_focus(&workspace, &pane, cx);
+                    });
+                });
+            }
             cx.notify();
         }
 
@@ -925,26 +947,54 @@ impl Pane {
         !self.nav_history.0.lock().forward_stack.is_empty()
     }
 
+    pub(crate) fn navigation_history_snapshot(&self) -> NavigationHistorySnapshot {
+        self.nav_history.snapshot()
+    }
+
     pub fn navigate_backward(&mut self, _: &GoBack, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(workspace) = self.workspace.upgrade() {
             let pane = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    workspace.go_back(pane, window, cx).detach_and_log_err(cx)
-                })
+                let multi_workspace = workspace
+                    .read(cx)
+                    .multi_workspace()
+                    .and_then(WeakEntity::upgrade);
+                if let Some(multi_workspace) = multi_workspace {
+                    multi_workspace.update(cx, |multi_workspace, cx| {
+                        multi_workspace
+                            .go_back(pane, window, cx)
+                            .detach_and_log_err(cx)
+                    });
+                } else {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.go_back(pane, window, cx).detach_and_log_err(cx)
+                    });
+                }
             })
         }
     }
 
-    fn navigate_forward(&mut self, _: &GoForward, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn navigate_forward(&mut self, _: &GoForward, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(workspace) = self.workspace.upgrade() {
             let pane = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    workspace
-                        .go_forward(pane, window, cx)
-                        .detach_and_log_err(cx)
-                })
+                let multi_workspace = workspace
+                    .read(cx)
+                    .multi_workspace()
+                    .and_then(WeakEntity::upgrade);
+                if let Some(multi_workspace) = multi_workspace {
+                    multi_workspace.update(cx, |multi_workspace, cx| {
+                        multi_workspace
+                            .go_forward(pane, window, cx)
+                            .detach_and_log_err(cx)
+                    });
+                } else {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace
+                            .go_forward(pane, window, cx)
+                            .detach_and_log_err(cx)
+                    });
+                }
             })
         }
     }
@@ -4606,6 +4656,10 @@ impl Render for Pane {
 }
 
 impl ItemNavHistory {
+    pub fn pane(&self) -> WeakEntity<Pane> {
+        self.history.0.lock().pane.clone()
+    }
+
     pub fn push<D: 'static + Any + Send + Sync>(
         &mut self,
         data: Option<D>,
@@ -4650,6 +4704,15 @@ impl ItemNavHistory {
 }
 
 impl NavHistory {
+    fn snapshot(&self) -> NavigationHistorySnapshot {
+        let state = self.0.lock();
+        NavigationHistorySnapshot {
+            backward_timestamp: state.backward_stack.back().map(|entry| entry.timestamp),
+            forward_timestamp: state.forward_stack.back().map(|entry| entry.timestamp),
+            normal_revision: state.normal_revision,
+        }
+    }
+
     pub fn for_each_entry(
         &self,
         cx: &App,
@@ -4746,6 +4809,7 @@ impl NavHistory {
         match state.mode {
             NavigationMode::Disabled => {}
             NavigationMode::Normal | NavigationMode::ReopeningClosedItem => {
+                state.normal_revision = state.normal_revision.wrapping_add(1);
                 state
                     .backward_stack
                     .retain(|entry| !is_same_location(entry));

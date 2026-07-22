@@ -5714,7 +5714,13 @@ impl Sidebar {
         });
 
         multi_workspace.update(cx, |multi_workspace, cx| {
-            multi_workspace.activate(workspace.clone(), None, window, cx);
+            multi_workspace.activate_for_panel_target(
+                workspace.clone(),
+                terminal_id.to_key_string(),
+                None,
+                window,
+                cx,
+            );
             if retain {
                 multi_workspace.retain_active_workspace(cx);
             }

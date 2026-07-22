@@ -103,8 +103,8 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, Workspace, WorkspaceId,
+    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PanelNavigationTarget, PathList,
+    SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::ItemEvent,
 };
@@ -184,7 +184,7 @@ impl TerminalId {
         Self(uuid::Uuid::new_v4())
     }
 
-    pub(crate) fn to_key_string(self) -> String {
+    pub fn to_key_string(self) -> String {
         self.0.hyphenated().to_string()
     }
 
@@ -2334,8 +2334,21 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let panel = cx.weak_entity();
+        let panel_navigation_target = PanelNavigationTarget::new(
+            terminal_id.to_key_string(),
+            terminal_view.focus_handle(cx).downgrade(),
+            move |window, cx| {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.activate_terminal(terminal_id, true, window, cx);
+                    })
+                    .log_err();
+            },
+        );
         terminal_view.update(cx, |terminal_view, _cx| {
             terminal_view.set_wakeup_refresh_interval(Some(TERMINAL_WAKEUP_REFRESH_INTERVAL));
+            terminal_view.set_panel_navigation_target(panel_navigation_target);
         });
         if let Some(custom_title) = custom_title {
             terminal_view.update(cx, |terminal_view, cx| {

@@ -21,6 +21,285 @@ fn init_test(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_navigation_history_crosses_workspace_boundaries(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project_a = Project::test(fs.clone(), [], cx).await;
+    let project_b = Project::test(fs.clone(), [], cx).await;
+    let project_c = Project::test(fs, [], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let (workspace_b, workspace_c) =
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            let workspace_b = multi_workspace.test_add_workspace(project_b, window, cx);
+            let workspace_c = multi_workspace.test_add_workspace(project_c, window, cx);
+            (workspace_b, workspace_c)
+        });
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &workspace_c);
+    });
+
+    cx.dispatch_action(crate::pane::GoBack);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &workspace_b);
+    });
+
+    cx.dispatch_action(crate::pane::GoBack);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &workspace_a);
+    });
+
+    cx.dispatch_action(crate::pane::GoForward);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &workspace_b);
+    });
+
+    cx.dispatch_action(crate::pane::GoForward);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &workspace_c);
+    });
+}
+
+#[gpui::test]
+async fn test_navigation_history_prefers_newer_active_workspace_entries(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project_a = Project::test(fs.clone(), [], cx).await;
+    let project_b = Project::test(fs, [], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    let item = cx.new(TestItem::new);
+    workspace_b.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+    });
+    item.update(cx, |item, cx| {
+        item.set_state("one".to_string(), cx);
+        item.set_state("two".to_string(), cx);
+    });
+    cx.run_until_parked();
+
+    cx.dispatch_action(crate::pane::GoBack);
+    cx.run_until_parked();
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.workspace(),
+            &workspace_b,
+            "newer pane navigation should be consumed before crossing workspaces"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_new_navigation_clears_cross_workspace_forward_history(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project_a = Project::test(fs.clone(), [], cx).await;
+    let project_b = Project::test(fs, [], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.dispatch_action(crate::pane::GoBack);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &workspace_a);
+    });
+
+    let item = cx.new(TestItem::new);
+    workspace_a.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+    });
+    item.update(cx, |item, cx| {
+        item.set_state("new branch".to_string(), cx);
+    });
+    cx.run_until_parked();
+
+    cx.dispatch_action(crate::pane::GoForward);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.workspace(),
+            &workspace_a,
+            "new pane navigation should discard cross-workspace forward history"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_navigation_history_crosses_pane_boundaries(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let pane_a = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+    let item_a = cx.new(TestItem::new);
+    let item_b = cx.new(TestItem::new);
+
+    let pane_b = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item_a.clone()), None, true, window, cx);
+        let pane_b = workspace.split_pane(pane_a.clone(), SplitDirection::Right, window, cx);
+        pane_b.update(cx, |pane, cx| {
+            pane.add_item(Box::new(item_b.clone()), true, true, None, window, cx);
+        });
+        pane_b
+    });
+    pane_a.update_in(cx, |pane, window, cx| {
+        pane.focus_active_item(window, cx);
+    });
+    cx.run_until_parked();
+
+    workspace.read_with(cx, |workspace, _| {
+        assert_eq!(workspace.active_pane(), &pane_a);
+    });
+    cx.dispatch_action(crate::pane::GoBack);
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _| {
+        assert_eq!(
+            workspace.active_pane(),
+            &pane_b,
+            "back navigation should return to the previously focused pane",
+        );
+    });
+
+    cx.dispatch_action(crate::pane::GoForward);
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, _| {
+        assert_eq!(
+            workspace.active_pane(),
+            &pane_a,
+            "forward navigation should restore the later focused pane",
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_navigation_history_restores_panel_target(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+    let panel_was_activated = Rc::new(Cell::new(false));
+    let panel_target = multi_workspace.update_in(cx, |multi_workspace, _window, cx| {
+        let focus_handle = cx.focus_handle();
+        let panel_was_activated_for_callback = panel_was_activated.clone();
+        let focus_handle_for_callback = focus_handle.clone();
+        let target = PanelNavigationTarget::new(
+            "test-panel",
+            focus_handle.downgrade(),
+            move |window, cx| {
+                panel_was_activated_for_callback.set(true);
+                focus_handle_for_callback.focus(window, cx);
+            },
+        );
+        multi_workspace.record_panel_focus(&workspace, target.clone(), cx);
+        multi_workspace.record_pane_focus(&workspace, &pane, cx);
+        target
+    });
+
+    cx.dispatch_action(crate::pane::GoBack);
+    cx.run_until_parked();
+    assert!(
+        panel_was_activated.get(),
+        "back navigation should invoke the panel target activation callback",
+    );
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace
+            .go_forward_from_panel(panel_target, window, cx)
+            .detach_and_log_err(cx);
+    });
+    cx.run_until_parked();
+    pane.update_in(cx, |pane, window, cx| {
+        assert!(pane.has_focus(window, cx));
+    });
+}
+
+#[gpui::test]
+async fn test_panel_target_replaces_provisional_pane_after_workspace_activation(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project_a = Project::test(fs.clone(), [], cx).await;
+    let project_b = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    cx.run_until_parked();
+    cx.dispatch_action(crate::pane::GoBack);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &workspace_a);
+    });
+
+    let panel_target = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let focus_handle = cx.focus_handle();
+        let focus_handle_for_callback = focus_handle.clone();
+        let target = PanelNavigationTarget::new(
+            "destination-terminal",
+            focus_handle.downgrade(),
+            move |window, cx| focus_handle_for_callback.focus(window, cx),
+        );
+        multi_workspace.activate_for_panel_target(
+            workspace_b.clone(),
+            "destination-terminal",
+            None,
+            window,
+            cx,
+        );
+        multi_workspace.record_panel_focus(&workspace_b, target.clone(), cx);
+        target
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace
+            .go_back_from_panel(panel_target, window, cx)
+            .detach_and_log_err(cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(
+            multi_workspace.workspace(),
+            &workspace_a,
+            "back navigation should skip the provisional file pane in the destination workspace",
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

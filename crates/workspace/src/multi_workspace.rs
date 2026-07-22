@@ -3,8 +3,8 @@ use fs::Fs;
 
 use gpui::{
     AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, Tiling, WeakEntity,
-    Window, WindowId, actions, deferred, px,
+    ManagedView, MouseButton, Pixels, Render, SharedString, Subscription, Task, TaskExt, Tiling,
+    WeakEntity, WeakFocusHandle, Window, WindowId, actions, deferred, px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
@@ -22,6 +22,7 @@ use zed_actions::agents_sidebar::ToggleThreadSwitcher;
 
 use agent_settings::AgentSettings;
 use settings::SidebarDockPosition;
+use std::collections::VecDeque;
 use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
@@ -29,9 +30,11 @@ const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
-    Panel, Workspace, WorkspaceId, client_side_decorations,
+    Pane, Panel, Workspace, WorkspaceId, client_side_decorations, pane::NavigationHistorySnapshot,
     persistence::model::MultiWorkspaceState,
 };
+
+const MAX_WORKSPACE_NAVIGATION_HISTORY_LEN: usize = 1024;
 
 actions!(
     multi_workspace,
@@ -303,6 +306,334 @@ pub struct ProjectGroupState {
     pub last_active_workspace: Option<WeakEntity<Workspace>>,
 }
 
+#[derive(Clone)]
+struct WorkspaceNavigationSegment {
+    workspace: WeakEntity<Workspace>,
+    target: WorkspaceNavigationTarget,
+    backward_boundary: Option<usize>,
+    forward_boundary: Option<usize>,
+    branch_revision: usize,
+}
+
+#[derive(Clone)]
+enum WorkspaceNavigationTarget {
+    Pane(WeakEntity<Pane>),
+    Panel(PanelNavigationTarget),
+}
+
+#[derive(Clone)]
+pub struct PanelNavigationTarget {
+    id: SharedString,
+    focus_handle: WeakFocusHandle,
+    activate: Rc<dyn Fn(&mut Window, &mut App)>,
+}
+
+impl PanelNavigationTarget {
+    pub fn new(
+        id: impl Into<SharedString>,
+        focus_handle: WeakFocusHandle,
+        activate: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            focus_handle,
+            activate: Rc::new(activate),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.focus_handle.upgrade().is_some()
+    }
+
+    fn activate(&self, window: &mut Window, cx: &mut App) {
+        (self.activate)(window, cx);
+    }
+}
+
+impl WorkspaceNavigationTarget {
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pane(left), Self::Pane(right)) => left.entity_id() == right.entity_id(),
+            (Self::Panel(left), Self::Panel(right)) => left.id == right.id,
+            _ => false,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Pane(pane) => pane.upgrade().is_some(),
+            Self::Panel(panel) => panel.is_valid(),
+        }
+    }
+
+    fn pane(&self) -> Option<WeakEntity<Pane>> {
+        match self {
+            Self::Pane(pane) => Some(pane.clone()),
+            Self::Panel(_) => None,
+        }
+    }
+
+    fn activate(&self, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Pane(pane) => {
+                if let Some(pane) = pane.upgrade() {
+                    pane.update(cx, |pane, cx| pane.focus_active_item(window, cx));
+                }
+            }
+            Self::Panel(panel) => panel.activate(window, cx),
+        }
+    }
+}
+
+impl WorkspaceNavigationSegment {
+    fn capture(workspace: &Entity<Workspace>, pane: &Entity<Pane>, cx: &App) -> Self {
+        let snapshot = pane.read(cx).navigation_history_snapshot();
+        Self {
+            workspace: workspace.downgrade(),
+            target: WorkspaceNavigationTarget::Pane(pane.downgrade()),
+            backward_boundary: snapshot.backward_timestamp,
+            forward_boundary: snapshot.forward_timestamp,
+            branch_revision: snapshot.normal_revision,
+        }
+    }
+
+    fn capture_active_pane(workspace: &Entity<Workspace>, cx: &App) -> Self {
+        Self::capture(workspace, workspace.read(cx).active_pane(), cx)
+    }
+
+    fn capture_panel(workspace: &Entity<Workspace>, panel: PanelNavigationTarget) -> Self {
+        Self {
+            workspace: workspace.downgrade(),
+            target: WorkspaceNavigationTarget::Panel(panel),
+            backward_boundary: None,
+            forward_boundary: None,
+            branch_revision: 0,
+        }
+    }
+
+    fn matches(&self, workspace: &Entity<Workspace>, target: &WorkspaceNavigationTarget) -> bool {
+        self.workspace.entity_id() == workspace.entity_id()
+            && self.target.matches(target)
+    }
+
+    fn snapshot(&self, cx: &App) -> Option<NavigationHistorySnapshot> {
+        self.target
+            .pane()?
+            .upgrade()
+            .map(|pane| pane.read(cx).navigation_history_snapshot())
+    }
+
+    fn prepare_for_manual_leave(mut self, cx: &App) -> Option<Self> {
+        let workspace = self.workspace.upgrade()?;
+        if matches!(self.target, WorkspaceNavigationTarget::Panel(_)) {
+            return self.target.is_valid().then_some(self);
+        }
+
+        let pane = self.target.pane()?;
+        let active_pane = workspace.read(cx).active_pane().clone();
+        if active_pane.entity_id() != pane.entity_id() {
+            return Some(Self::capture(&workspace, &active_pane, cx));
+        }
+
+        let snapshot = active_pane.read(cx).navigation_history_snapshot();
+        self.forward_boundary = snapshot.forward_timestamp;
+        self.branch_revision = snapshot.normal_revision;
+        Some(self)
+    }
+
+    fn prepare_for_target_leave(mut self, cx: &App) -> Option<Self> {
+        if let Some(pane) = self.target.pane() {
+            let pane = pane.upgrade()?;
+            let snapshot = pane.read(cx).navigation_history_snapshot();
+            self.forward_boundary = snapshot.forward_timestamp;
+            self.branch_revision = snapshot.normal_revision;
+        } else if !self.target.is_valid() {
+            return None;
+        }
+        Some(self)
+    }
+
+    fn prepare_for_restore(
+        mut self,
+        cx: &App,
+    ) -> Option<(Self, Entity<Workspace>, WorkspaceNavigationTarget)> {
+        let workspace = self.workspace.upgrade()?;
+        if let WorkspaceNavigationTarget::Pane(pane) = &self.target {
+            let pane = pane
+                .upgrade()
+                .unwrap_or_else(|| workspace.read(cx).active_pane().clone());
+            let snapshot = pane.read(cx).navigation_history_snapshot();
+            self.target = WorkspaceNavigationTarget::Pane(pane.downgrade());
+            self.branch_revision = snapshot.normal_revision;
+        } else if !self.target.is_valid() {
+            return None;
+        }
+        let target = self.target.clone();
+        Some((self, workspace, target))
+    }
+}
+
+#[derive(Default)]
+struct WorkspaceNavigationHistory {
+    active: Option<WorkspaceNavigationSegment>,
+    backward_stack: VecDeque<WorkspaceNavigationSegment>,
+    forward_stack: VecDeque<WorkspaceNavigationSegment>,
+    navigating: bool,
+}
+
+impl WorkspaceNavigationHistory {
+    fn new(workspace: &Entity<Workspace>, cx: &App) -> Self {
+        Self {
+            active: Some(WorkspaceNavigationSegment::capture_active_pane(
+                workspace, cx,
+            )),
+            ..Self::default()
+        }
+    }
+
+    fn push_backward(&mut self, segment: WorkspaceNavigationSegment) {
+        if self.backward_stack.len() >= MAX_WORKSPACE_NAVIGATION_HISTORY_LEN {
+            self.backward_stack.pop_front();
+        }
+        self.backward_stack.push_back(segment);
+    }
+
+    fn push_forward(&mut self, segment: WorkspaceNavigationSegment) {
+        if self.forward_stack.len() >= MAX_WORKSPACE_NAVIGATION_HISTORY_LEN {
+            self.forward_stack.pop_front();
+        }
+        self.forward_stack.push_back(segment);
+    }
+
+    fn record_manual_switch(&mut self, workspace: &Entity<Workspace>, cx: &App) {
+        let segment = self
+            .active
+            .take()
+            .filter(|segment| segment.workspace.entity_id() == workspace.entity_id())
+            .or_else(|| {
+                Some(WorkspaceNavigationSegment::capture_active_pane(
+                    workspace, cx,
+                ))
+            })
+            .and_then(|segment| segment.prepare_for_manual_leave(cx));
+        if let Some(segment) = segment {
+            self.push_backward(segment);
+        }
+        self.forward_stack.clear();
+    }
+
+    fn record_target_switch(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        target: WorkspaceNavigationTarget,
+        cx: &App,
+    ) {
+        if self.navigating
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|segment| segment.matches(workspace, &target))
+        {
+            return;
+        }
+
+        if let Some(segment) = self
+            .active
+            .take()
+            .and_then(|segment| segment.prepare_for_target_leave(cx))
+        {
+            self.push_backward(segment);
+        }
+        self.forward_stack.clear();
+        self.active = Some(match target {
+            WorkspaceNavigationTarget::Pane(pane) => {
+                let pane = pane
+                    .upgrade()
+                    .unwrap_or_else(|| workspace.read(cx).active_pane().clone());
+                WorkspaceNavigationSegment::capture(workspace, &pane, cx)
+            }
+            WorkspaceNavigationTarget::Panel(panel) => {
+                WorkspaceNavigationSegment::capture_panel(workspace, panel)
+            }
+        });
+    }
+
+    fn record_pane_switch(&mut self, workspace: &Entity<Workspace>, pane: &Entity<Pane>, cx: &App) {
+        self.record_target_switch(
+            workspace,
+            WorkspaceNavigationTarget::Pane(pane.downgrade()),
+            cx,
+        );
+    }
+
+    fn synchronize_active(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        target: &WorkspaceNavigationTarget,
+        cx: &App,
+    ) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|segment| segment.matches(workspace, target))
+        {
+            return;
+        }
+        self.record_target_switch(workspace, target.clone(), cx);
+    }
+
+    fn discard_forward_if_branched(&mut self, cx: &App) -> bool {
+        let Some(segment) = self.active.as_mut() else {
+            return false;
+        };
+        let Some(snapshot) = segment.snapshot(cx) else {
+            return false;
+        };
+        if snapshot.normal_revision != segment.branch_revision {
+            self.forward_stack.clear();
+            segment.branch_revision = snapshot.normal_revision;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove_workspace(&mut self, workspace_id: EntityId) {
+        self.backward_stack
+            .retain(|segment| segment.workspace.entity_id() != workspace_id);
+        self.forward_stack
+            .retain(|segment| segment.workspace.entity_id() != workspace_id);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|segment| segment.workspace.entity_id() == workspace_id)
+        {
+            self.active = None;
+        }
+    }
+
+    fn prune_invalid_targets(
+        stack: &mut VecDeque<WorkspaceNavigationSegment>,
+        active_workspace_id: EntityId,
+        active_target: &WorkspaceNavigationTarget,
+    ) {
+        while stack.back().is_some_and(|segment| {
+            (segment.workspace.entity_id() == active_workspace_id
+                && segment.target.matches(active_target))
+                || segment.workspace.upgrade().is_none()
+                || !segment.target.is_valid()
+        }) {
+            stack.pop_back();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceNavigationDirection {
+    Backward,
+    Forward,
+}
+
 pub struct MultiWorkspace {
     window_id: WindowId,
     retained_workspaces: Vec<Entity<Workspace>>,
@@ -322,6 +653,9 @@ pub struct MultiWorkspace {
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
+    navigation_history: WorkspaceNavigationHistory,
+    pending_panel_target_after_activation: Option<(EntityId, SharedString)>,
+    ignored_pane_focus_after_panel_activation: Option<(EntityId, EntityId)>,
 }
 
 impl EventEmitter<MultiWorkspaceEvent> for MultiWorkspace {}
@@ -365,6 +699,7 @@ impl MultiWorkspace {
         Self::subscribe_to_workspace(&workspace, window, cx);
         let weak_self = cx.weak_entity();
         let active_workspace_id = Rc::new(Cell::new(workspace.entity_id()));
+        let navigation_history = WorkspaceNavigationHistory::new(&workspace, cx);
         workspace.update(cx, |workspace, cx| {
             workspace.set_multi_workspace(weak_self, active_workspace_id.clone(), cx);
         });
@@ -385,6 +720,9 @@ impl MultiWorkspace {
                 settings_subscription,
             ],
             previous_focus_handle: None,
+            navigation_history,
+            pending_panel_target_after_activation: None,
+            ignored_pane_focus_after_panel_activation: None,
         }
     }
 
@@ -632,11 +970,24 @@ impl MultiWorkspace {
         })
         .detach();
 
-        cx.subscribe_in(workspace, window, |this, workspace, event, window, cx| {
-            if let WorkspaceEvent::Activate = event {
-                this.activate(workspace.clone(), None, window, cx);
-            }
-        })
+        cx.subscribe_in(
+            workspace,
+            window,
+            |this, workspace, event, window, cx| match event {
+                WorkspaceEvent::Activate => {
+                    this.activate(workspace.clone(), None, window, cx);
+                }
+                WorkspaceEvent::ActiveItemChanged
+                    if workspace == &this.active_workspace
+                        && !this.navigation_history.navigating =>
+                {
+                    let pane = workspace.read(cx).active_pane().clone();
+                    this.navigation_history
+                        .record_pane_switch(workspace, &pane, cx);
+                }
+                _ => {}
+            },
+        )
         .detach();
     }
 
@@ -1521,9 +1872,46 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_panel_target_after_activation = None;
+        self.ignored_pane_focus_after_panel_activation = None;
+        self.activate_internal(workspace, source_workspace, window, cx);
+    }
+
+    pub fn activate_for_panel_target(
+        &mut self,
+        workspace: Entity<Workspace>,
+        target_id: impl Into<SharedString>,
+        source_workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace() == &workspace {
+            return;
+        }
+        self.pending_panel_target_after_activation =
+            Some((workspace.entity_id(), target_id.into()));
+        self.ignored_pane_focus_after_panel_activation = Some((
+            workspace.entity_id(),
+            workspace.read(cx).active_pane().entity_id(),
+        ));
+        self.activate_internal(workspace, source_workspace, window, cx);
+    }
+
+    fn activate_internal(
+        &mut self,
+        workspace: Entity<Workspace>,
+        source_workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.workspace() == &workspace {
             self.focus_active_workspace(window, cx);
             return;
+        }
+
+        if !self.navigation_history.navigating {
+            self.navigation_history
+                .record_manual_switch(&self.active_workspace, cx);
         }
 
         let old_active_workspace = self.active_workspace.clone();
@@ -1550,6 +1938,13 @@ impl MultiWorkspace {
         // to decide who owns the window chrome.
         self.active_workspace_id
             .set(self.active_workspace.entity_id());
+
+        if !self.navigation_history.navigating {
+            self.navigation_history.active = Some(WorkspaceNavigationSegment::capture_active_pane(
+                &self.active_workspace,
+                cx,
+            ));
+        }
 
         let active_key = self.active_workspace.read(cx).project_group_key(cx);
         if let Some(group) = self.project_groups.iter_mut().find(|g| g.key == active_key) {
@@ -1635,6 +2030,8 @@ impl MultiWorkspace {
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
     fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        self.navigation_history
+            .remove_workspace(workspace.entity_id());
         self.retained_workspaces
             .retain(|retained| retained != workspace);
         for group in &mut self.project_groups {
@@ -1749,6 +2146,204 @@ impl MultiWorkspace {
             })
         };
         window.focus(&focus_handle, cx);
+    }
+
+    pub(crate) fn go_back(
+        &mut self,
+        pane: WeakEntity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.navigate_history(
+            WorkspaceNavigationDirection::Backward,
+            WorkspaceNavigationTarget::Pane(pane),
+            window,
+            cx,
+        )
+    }
+
+    pub(crate) fn record_pane_focus(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        pane: &Entity<Pane>,
+        cx: &App,
+    ) {
+        if workspace == &self.active_workspace {
+            if self
+                .ignored_pane_focus_after_panel_activation
+                .as_ref()
+                .is_some_and(|(workspace_id, pane_id)| {
+                    *workspace_id == workspace.entity_id() && *pane_id == pane.entity_id()
+                })
+            {
+                self.ignored_pane_focus_after_panel_activation = None;
+                return;
+            }
+            self.navigation_history
+                .record_pane_switch(workspace, pane, cx);
+        }
+    }
+
+    pub(crate) fn go_forward(
+        &mut self,
+        pane: WeakEntity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.navigate_history(
+            WorkspaceNavigationDirection::Forward,
+            WorkspaceNavigationTarget::Pane(pane),
+            window,
+            cx,
+        )
+    }
+
+    pub fn record_panel_focus(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        panel: PanelNavigationTarget,
+        cx: &App,
+    ) {
+        if workspace == &self.active_workspace {
+            let replace_provisional_pane = self
+                .pending_panel_target_after_activation
+                .as_ref()
+                .is_some_and(|(workspace_id, target_id)| {
+                    *workspace_id == workspace.entity_id() && target_id == &panel.id
+                });
+            if replace_provisional_pane {
+                self.pending_panel_target_after_activation = None;
+                self.navigation_history.active = Some(
+                    WorkspaceNavigationSegment::capture_panel(workspace, panel),
+                );
+                return;
+            }
+            self.navigation_history.record_target_switch(
+                workspace,
+                WorkspaceNavigationTarget::Panel(panel),
+                cx,
+            );
+        }
+    }
+
+    pub fn go_back_from_panel(
+        &mut self,
+        panel: PanelNavigationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.navigate_history(
+            WorkspaceNavigationDirection::Backward,
+            WorkspaceNavigationTarget::Panel(panel),
+            window,
+            cx,
+        )
+    }
+
+    pub fn go_forward_from_panel(
+        &mut self,
+        panel: PanelNavigationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.navigate_history(
+            WorkspaceNavigationDirection::Forward,
+            WorkspaceNavigationTarget::Panel(panel),
+            window,
+            cx,
+        )
+    }
+
+    fn navigate_history(
+        &mut self,
+        direction: WorkspaceNavigationDirection,
+        navigation_target: WorkspaceNavigationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let active_workspace = self.active_workspace.clone();
+        self.navigation_history
+            .synchronize_active(&active_workspace, &navigation_target, cx);
+        self.navigation_history.discard_forward_if_branched(cx);
+
+        let active_workspace_id = active_workspace.entity_id();
+        let has_cross_workspace_target = {
+            let cross_workspace_stack = match direction {
+                WorkspaceNavigationDirection::Backward => {
+                    &mut self.navigation_history.backward_stack
+                }
+                WorkspaceNavigationDirection::Forward => &mut self.navigation_history.forward_stack,
+            };
+            WorkspaceNavigationHistory::prune_invalid_targets(
+                cross_workspace_stack,
+                active_workspace_id,
+                &navigation_target,
+            );
+            !cross_workspace_stack.is_empty()
+        };
+
+        let pane = navigation_target.pane();
+        let pane_snapshot = pane
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .map(|pane| pane.read(cx).navigation_history_snapshot());
+        let boundary =
+            self.navigation_history
+                .active
+                .as_ref()
+                .and_then(|segment| match direction {
+                    WorkspaceNavigationDirection::Backward => segment.backward_boundary,
+                    WorkspaceNavigationDirection::Forward => segment.forward_boundary,
+                });
+        let local_timestamp = pane_snapshot.and_then(|snapshot| match direction {
+            WorkspaceNavigationDirection::Backward => snapshot.backward_timestamp,
+            WorkspaceNavigationDirection::Forward => snapshot.forward_timestamp,
+        });
+        let local_entry_is_newer_than_boundary = local_timestamp
+            .is_some_and(|timestamp| boundary.is_none_or(|boundary| timestamp > boundary));
+
+        if !has_cross_workspace_target || local_entry_is_newer_than_boundary {
+            let Some(pane) = pane else {
+                return Task::ready(Ok(()));
+            };
+            return active_workspace.update(cx, |workspace, cx| match direction {
+                WorkspaceNavigationDirection::Backward => workspace.go_back(pane, window, cx),
+                WorkspaceNavigationDirection::Forward => workspace.go_forward(pane, window, cx),
+            });
+        }
+
+        let target = match direction {
+            WorkspaceNavigationDirection::Backward => {
+                self.navigation_history.backward_stack.pop_back()
+            }
+            WorkspaceNavigationDirection::Forward => {
+                self.navigation_history.forward_stack.pop_back()
+            }
+        };
+        let Some((target, target_workspace, target_navigation_target)) =
+            target.and_then(|target| target.prepare_for_restore(cx))
+        else {
+            return Task::ready(Ok(()));
+        };
+
+        if let Some(current) = self.navigation_history.active.take() {
+            match direction {
+                WorkspaceNavigationDirection::Backward => {
+                    self.navigation_history.push_forward(current)
+                }
+                WorkspaceNavigationDirection::Forward => {
+                    self.navigation_history.push_backward(current)
+                }
+            }
+        }
+        self.navigation_history.active = Some(target);
+        self.navigation_history.navigating = true;
+        if target_workspace.entity_id() != active_workspace_id {
+            self.activate(target_workspace, None, window, cx);
+        }
+        target_navigation_target.activate(window, cx);
+        self.navigation_history.navigating = false;
+        Task::ready(Ok(()))
     }
 
     pub fn panel<T: Panel>(&self, cx: &App) -> Option<Entity<T>> {

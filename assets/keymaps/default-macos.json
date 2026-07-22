@@ -1287,7 +1287,8 @@
       "cmd-k": "terminal::Clear",
       "cmd-n": "workspace::NewTerminal",
       "ctrl-enter": "assistant::InlineAssist",
-      "ctrl-_": null, // emacs undo
+      "ctrl--": "pane::GoBack",
+      "ctrl-_": "pane::GoForward",
       // Some nice conveniences
       "cmd-backspace": ["terminal::SendKeystroke", "ctrl-u"], // clear line
       "alt-delete": ["terminal::SendText", "\u001bd"], // alt-d: delete word forward
